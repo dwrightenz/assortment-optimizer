@@ -222,7 +222,7 @@ function buildActivationRecos(analysis,tramosData,satLevel){
   const locals=Object.keys(sp),allItems=[...new Set(R.map(r=>r.item))];
   function cosSim(a,b){let d=0,na=0,nb=0;for(const it of allItems){const va=a[it]||0,vb=b[it]||0;d+=va*vb;na+=va*va;nb+=vb*vb;}return(na>0&&nb>0)?d/(Math.sqrt(na)*Math.sqrt(nb)):0;}
   const simMap={};for(const loc of locals){const sims=[];for(const o of locals){if(o===loc)continue;sims.push({local:o,sim:cosSim(sp[loc],sp[o])});}sims.sort((a,b)=>b.sim-a.sim);simMap[loc]=sims.slice(0,5).filter(s=>s.sim>.3);}
-  const ip={};R.forEach(r=>{if(!ip[r.item])ip[r.item]={};ip[r.item][r.local]={vta:r.totalVenta,rent:r.totalRent,cant:r.totalCant,mrg:r.avgMargen,score:r.compositeScore,subClasif:r.subClasif,marca:r.marca,tamano:r.tamano,proveedor:r.proveedor,origen:r.origen};});
+  const ip={};R.forEach(r=>{if(!ip[r.item])ip[r.item]={};ip[r.item][r.local]={vta:r.totalVenta,rent:r.totalRent,cant:r.totalCant,mrg:r.avgMargen,score:r.compositeScore,clasificacion:r.clasificacion||"",subClasif:r.subClasif,marca:r.marca,tamano:r.tamano,proveedor:r.proveedor,origen:r.origen};});
   // Count items per local+clasificacion+subClasif for cannibalization
   const scCount={};R.forEach(r=>{const k=r.local+"|||"+(r.clasificacion||"")+"|||"+r.subClasif;scCount[k]=(scCount[k]||0)+1;});
   // Total sales per local+clasificacion+subClasif for cannibalization
