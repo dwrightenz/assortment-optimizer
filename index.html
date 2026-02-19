@@ -787,24 +787,41 @@ function _buildPPTXNative(a,fd){
     _kpiCard(60,emu(6.7),emu(2.8),emu(2.8),emu(1.2),"$"+fmt(arRN),"RENT NETA INCREMENTAL",GRN)
   ));
 
-  // --- SLIDE 5: Por Sub Clasificación ---
-  var bySCR={};R.forEach(function(r){if(!bySCR[r.subClasif])bySCR[r.subClasif]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[r.subClasif].fl++;bySCR[r.subClasif].vfl+=r.totalVenta;bySCR[r.subClasif].rfl+=r.totalRent;}});
-  var bySCA={};(AR||[]).forEach(function(r){if(!bySCA[r.subClasif])bySCA[r.subClasif]={n:0,vNt:0,rNt:0};bySCA[r.subClasif].n++;bySCA[r.subClasif].vNt+=(r.netVta||0);bySCA[r.subClasif].rNt+=(r.netRent||0);});
-  var allSCK=[].concat(Object.keys(bySCR),Object.keys(bySCA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
-  var scHdr=[{text:"Sub Clasif.",clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
+  // --- SLIDE 5: Por Clasificación / Sub Clasificación ---
+  var dimFld=a.isMultiClasif?"clasificacion":"subClasif";
+  var dimLbl=a.isMultiClasif?"Clasificación":"Sub Clasif.";
+  var dimTitle=a.isMultiClasif?"POR CLASIFICACIÓN":"POR SUB CLASIFICACIÓN";
+  var recoDimFld=dimFld==="clasificacion"?"clasificacion":"subClasif";
+  var bySCR={};R.forEach(function(r){var k=r[dimFld];if(!bySCR[k])bySCR[k]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[k].fl++;bySCR[k].vfl+=r.totalVenta;bySCR[k].rfl+=r.totalRent;}});
+  var bySCA={};(AR||[]).forEach(function(r){var k=r[recoDimFld];if(!bySCA[k])bySCA[k]={n:0,vNt:0,rNt:0};bySCA[k].n++;bySCA[k].vNt+=(r.netVta||0);bySCA[k].rNt+=(r.netRent||0);});
+  var allSCK=[].concat(Object.keys(bySCR),Object.keys(bySCA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){var brA=((bySCA[a]||{rNt:0}).rNt-(bySCR[a]||{rfl:0}).rfl);var brB=((bySCA[b]||{rNt:0}).rNt-(bySCR[b]||{rfl:0}).rfl);return brB-brA;});
+  var scHdr=[{text:dimLbl,clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
   var scRows=allSCK.slice(0,12).map(function(k,i){var r=bySCR[k]||{fl:0,vfl:0,rfl:0};var ac=bySCA[k]||{n:0,vNt:0,rNt:0};var bg=i%2===0?BG:BG2;var bv=ac.vNt-r.vfl;var br=ac.rNt-r.rfl;
     return[{text:k.substring(0,24),clr:TXT,fill:bg},{text:String(r.fl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:"$"+fmt(r.vfl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:"$"+fmt(r.rfl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:String(ac.n),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(ac.vNt),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(ac.rNt),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(bv),clr:bv>=0?GRN:RED,fill:bg,align:'ctr',bold:true},{text:"$"+fmt(br),clr:br>=0?GRN:RED,fill:bg,align:'ctr',bold:true}];
   });
   var cW5=[emu(1.6),emu(0.5),emu(0.95),emu(0.95),emu(0.5),emu(0.95),emu(0.95),emu(0.95),emu(0.95)];
   slides.push(_mkSlide(BG,
-    _txBox(2,emu(0.5),emu(0.3),emu(9),emu(0.5),_para(_run("POR SUB CLASIFICACIÓN",2400,TXT,true,'Trebuchet MS')))+
+    _txBox(2,emu(0.5),emu(0.3),emu(9),emu(0.5),_para(_run(dimTitle,2400,TXT,true,'Trebuchet MS')))+
     _table(3,emu(0.5),emu(1.0),emu(9),[scHdr].concat(scRows),cW5,{fontSize:900})
   ));
 
-  // --- SLIDE 6: Por Marca ---
+  // --- SLIDE 6: Por Proveedor ---
+  var byPR={};R.filter(function(r){return r.flagged;}).forEach(function(r){if(!byPR[r.proveedor])byPR[r.proveedor]={fl:0,vfl:0,rfl:0};byPR[r.proveedor].fl++;byPR[r.proveedor].vfl+=r.totalVenta;byPR[r.proveedor].rfl+=r.totalRent;});
+  var byPA={};(AR||[]).forEach(function(r){if(!byPA[r.proveedor])byPA[r.proveedor]={n:0,vNt:0,rNt:0};byPA[r.proveedor].n++;byPA[r.proveedor].vNt+=(r.netVta||0);byPA[r.proveedor].rNt+=(r.netRent||0);});
+  var allPK=[].concat(Object.keys(byPR),Object.keys(byPA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){var brA=((byPA[a]||{rNt:0}).rNt-(byPR[a]||{rfl:0}).rfl);var brB=((byPA[b]||{rNt:0}).rNt-(byPR[b]||{rfl:0}).rfl);return brB-brA;}).slice(0,12);
+  var pHdr=[{text:"Proveedor",clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
+  var pRows=allPK.map(function(k,i){var r=byPR[k]||{fl:0,vfl:0,rfl:0};var ac=byPA[k]||{n:0,vNt:0,rNt:0};var bg=i%2===0?BG:BG2;var bv=ac.vNt-r.vfl;var br=ac.rNt-r.rfl;
+    return[{text:k.substring(0,24),clr:TXT,fill:bg},{text:String(r.fl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:"$"+fmt(r.vfl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:"$"+fmt(r.rfl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:String(ac.n),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(ac.vNt),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(ac.rNt),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(bv),clr:bv>=0?GRN:RED,fill:bg,align:'ctr',bold:true},{text:"$"+fmt(br),clr:br>=0?GRN:RED,fill:bg,align:'ctr',bold:true}];
+  });
+  slides.push(_mkSlide(BG,
+    _txBox(2,emu(0.5),emu(0.3),emu(9),emu(0.5),_para(_run("POR PROVEEDOR (Top 12)",2400,TXT,true,'Trebuchet MS')))+
+    _table(3,emu(0.5),emu(1.0),emu(9),[pHdr].concat(pRows),cW5,{fontSize:900})
+  ));
+
+  // --- SLIDE 7: Por Marca ---
   var byMR={};R.filter(function(r){return !r.esImportado&&r.flagged;}).forEach(function(r){if(!byMR[r.marca])byMR[r.marca]={fl:0,vfl:0,rfl:0};byMR[r.marca].fl++;byMR[r.marca].vfl+=r.totalVenta;byMR[r.marca].rfl+=r.totalRent;});
   var byMA={};(AR||[]).forEach(function(r){if(!byMA[r.marca])byMA[r.marca]={n:0,vNt:0,rNt:0};byMA[r.marca].n++;byMA[r.marca].vNt+=(r.netVta||0);byMA[r.marca].rNt+=(r.netRent||0);});
-  var allMK=[].concat(Object.keys(byMR),Object.keys(byMA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){return (byMR[b]||{fl:0}).fl-(byMR[a]||{fl:0}).fl;}).slice(0,12);
+  var allMK=[].concat(Object.keys(byMR),Object.keys(byMA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){var brA=((byMA[a]||{rNt:0}).rNt-(byMR[a]||{rfl:0}).rfl);var brB=((byMA[b]||{rNt:0}).rNt-(byMR[b]||{rfl:0}).rfl);return brB-brA;}).slice(0,12);
   var mHdr=[{text:"Marca",clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
   var mRows=allMK.map(function(k,i){var r=byMR[k]||{fl:0,vfl:0,rfl:0};var ac=byMA[k]||{n:0,vNt:0,rNt:0};var bg=i%2===0?BG:BG2;var bv=ac.vNt-r.vfl;var br=ac.rNt-r.rfl;
     return[{text:k.substring(0,20),clr:TXT,fill:bg},{text:String(r.fl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:"$"+fmt(r.vfl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:"$"+fmt(r.rfl),clr:'FCA5A5',fill:bg,align:'ctr'},{text:String(ac.n),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(ac.vNt),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(ac.rNt),clr:'86EFAC',fill:bg,align:'ctr'},{text:"$"+fmt(bv),clr:bv>=0?GRN:RED,fill:bg,align:'ctr',bold:true},{text:"$"+fmt(br),clr:br>=0?GRN:RED,fill:bg,align:'ctr',bold:true}];
@@ -814,7 +831,7 @@ function _buildPPTXNative(a,fd){
     _table(3,emu(0.5),emu(1.0),emu(9),[mHdr].concat(mRows),cW5,{fontSize:900})
   ));
 
-  // --- SLIDE 7: Marcas Acción ---
+  // --- SLIDE 8: Marcas Acción ---
   var bSlice=B.slice(0,10);
   var bHdr2=[{text:"Acción",clr:TXT,bold:true,fill:BG2},{text:"Marca",clr:TXT,bold:true,fill:BG2},{text:"Local",clr:TXT,bold:true,fill:BG2},{text:"Flag/Tot",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"%",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
   var bRows2=bSlice.map(function(b,i){var bg=i%2===0?BG:BG2;
@@ -826,7 +843,7 @@ function _buildPPTXNative(a,fd){
     _table(3,emu(0.5),emu(1.0),emu(9),[bHdr2].concat(bRows2),cW7,{fontSize:900})
   ));
 
-  // --- SLIDE 8: Next Steps ---
+  // --- SLIDE 9: Next Steps ---
   var steps=[
     {n:"1. Retirar alcances",clr:RED,desc:"Retirar "+skuRetiro+" SKUs ("+F.length+" items). Iniciar con "+crit.length+" críticos (score<10). Impacto: $"+fmt(vf)+" venta, $"+fmt(rf)+" rent."},
     {n:"2. Descodificar marcas",clr:ORG,desc:B.length+" marcas identificadas para retiro total o parcial."},
@@ -906,7 +923,7 @@ const S={step:"upload",ventasFile:null,alcancesFile:null,analysis:null,loading:f
   nfPanelOpen:false,sortBy:"compositeScore",sortDir:"asc",openDrop:null,dropSearch:"",page:0,PS:200,
   simLevel:"all",resDim:"subClasif",
   satLevel:"no_saturada",tramosFile:null,tramosPreview:null,prevStep:"upload",
-  execSort:"ret",execDir:"desc",
+  execSort:"balR",execDir:"desc",
 };
 let allLocals=[],allClasifs=[],allSCs=[],allMarcas=[],allProvs=[];
 function ss(p){Object.assign(S,p);render();}
