@@ -154,9 +154,9 @@ function parseVentas(wb,filename){
     for(const l of locs){items.push({local:l.name,clasificacion:cf,subClasif:sc,item:iv,tamano:tm,marca:mk,proveedor:pv,origen:or,claseMerc:cl,esImportado:/import/i.test(or),ventaUSD:parseFloat(c(r,l.col))||0,cantidad:parseFloat(c(r,l.col+1))||0,rentabilidad:parseFloat(c(r,l.col+2))||0,margen:parseFloat(c(r,l.col+3))||0});}
   }
   const clasificaciones=[...clasificSet].sort();
-  // Single clasif from filename as fallback when no column found
-  const clasificacion=clasificaciones.length>0?clasificaciones.join(" + "):extractClasifName(filename);
   const isMultiClasif=clasificaciones.length>1;
+  // Display label: always from filename (informative), clasificaciones array for data
+  const clasificacion=extractClasifName(filename)||( clasificaciones.length?clasificaciones[0]:"");
   return{items,locals:locs.map(l=>l.name),subClasifs:[...subClasifSet].sort(),clasificacion,clasificaciones,isMultiClasif};
 }
 
@@ -931,7 +931,7 @@ async function analyze(){
     allSCs=[...new Set(r.results.map(x=>x.subClasif))].sort();
     allMarcas=[...new Set(r.results.map(x=>x.marca))].sort();
     allProvs=[...new Set(r.results.map(x=>x.proveedor))].sort();
-    ss({analysis:r,step:"results",loading:false,page:0,tab:"exec"});
+    ss({analysis:r,step:"results",loading:false,page:0,tab:"exec",resDim:r.isMultiClasif?"clasificacion":"subClasif"});
   }catch(e){ss({error:"Error: "+e.message,loading:false});}
 }
 
@@ -1237,7 +1237,7 @@ function renderResults(app){
     <div class="crd" style="margin-bottom:10px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:6px">
         <div style="font-size:11px;font-weight:700;color:var(--tx2)">RETIRO + ACTIVACIÓN + BALANCE</div>
-        <div class="sim-tabs" style="margin:0">${[...(a.isMultiClasif?[{id:"clasificacion",l:"Clasif."}]:[]),{id:"subClasif",l:"Sub Clasif."},{id:"marca",l:"Marca"},{id:"proveedor",l:"Proveedor"},{id:"local",l:"Local"}].map(d=>`<button class="sim-tab ${S.resDim===d.id?"on":""}" onclick="ss({resDim:'${d.id}'})">${d.l}</button>`).join("")}</div>
+        <div class="sim-tabs" style="margin:0">${(a.isMultiClasif?[{id:"clasificacion",l:"Clasificación"},{id:"marca",l:"Marca"},{id:"proveedor",l:"Proveedor"},{id:"local",l:"Local"}]:[{id:"subClasif",l:"Sub Clasif."},{id:"marca",l:"Marca"},{id:"proveedor",l:"Proveedor"},{id:"local",l:"Local"}]).map(d=>`<button class="sim-tab ${S.resDim===d.id?"on":""}" onclick="ss({resDim:'${d.id}'})">${d.l}</button>`).join("")}</div>
       </div>
       <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
         <div class="stat"><div class="stat-v">${tblData.length}</div><div class="stat-l">${dimLabel}s</div></div>
