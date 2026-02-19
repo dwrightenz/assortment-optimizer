@@ -68,6 +68,43 @@ const fI=n=>(n==null||isNaN(n))?"—":Math.round(n).toLocaleString();
 const fS=n=>(n==null||isNaN(n))?"—":n.toFixed(1);
 const esc=s=>{const d=document.createElement("div");d.textContent=s;return d.innerHTML;};
 
+// ═══ SATURATION LEVELS ═══
+const SAT_LEVELS={
+  muy_saturada:{label:"Muy Saturada",actMod:0.60,retMod:1.15,color:"var(--red)"},
+  saturada:{label:"Saturada",actMod:0.80,retMod:1.08,color:"var(--orange)"},
+  medio_saturada:{label:"Medio Saturada",actMod:0.92,retMod:1.03,color:"var(--yellow)"},
+  no_saturada:{label:"No Saturada",actMod:1.00,retMod:1.00,color:"var(--green)"}
+};
+
+// ═══ TRAMOS — localStorage persistence ═══
+function loadTramos(){try{return JSON.parse(localStorage.getItem("assortOptTramos"))||{};}catch(e){return{};}}
+function saveTramos(data){localStorage.setItem("assortOptTramos",JSON.stringify(data));}
+function getTramosForClasif(clasificacion){if(!clasificacion)return null;const all=loadTramos();const key=clasificacion.toUpperCase();return all[key]||null;}
+
+function parseTramos(wb){
+  const ws=wb.Sheets[wb.SheetNames[0]],rng=XLSX.utils.decode_range(ws["!ref"]);
+  const c=(r,col)=>{const a=XLSX.utils.encode_cell({r,c:col});return ws[a]?ws[a].v:null;};
+  // Find columns: Local, Clasificación, Tramos
+  const hdr=[];for(let i=0;i<=rng.e.c;i++)hdr.push((c(0,i)||"").toString().toLowerCase().trim());
+  let cLocal=-1,cClasif=-1,cTramos=-1;
+  hdr.forEach((h,i)=>{
+    if(h.includes("local"))cLocal=i;
+    else if(h.includes("clasif")||h.includes("categoria")||h.includes("clasif"))cClasif=i;
+    else if(h.includes("tramo")||h.includes("gondola")||h.includes("módulo")||h.includes("modulo"))cTramos=i;
+  });
+  if(cLocal<0||cClasif<0||cTramos<0)throw new Error("Archivo de tramos debe tener columnas: Local, Clasificación, Tramos");
+  const result={};
+  for(let r=1;r<=rng.e.r;r++){
+    const local=(c(r,cLocal)||"").toString().trim();
+    const clasif=(c(r,cClasif)||"").toString().trim().toUpperCase();
+    const tramos=parseFloat(c(r,cTramos))||0;
+    if(!local||!clasif||tramos<=0)continue;
+    if(!result[clasif])result[clasif]={};
+    result[clasif][local]=tramos;
+  }
+  return result;
+}
+
 // ═══ PERCENTILE — handles ties ═══
 function pctRank(arr,val){const n=arr.length;if(n<=1)return 50;let bw=0,eq=0;for(const v of arr){if(v<val-0.0001)bw++;else if(Math.abs(v-val)<0.0001)eq++;}return Math.min(((bw+.5*eq)/n)*100,100);}
 
@@ -157,8 +194,11 @@ function runAnalysis(vd,ad){
 }
 
 // ═══ ACTIVATION RECOMMENDATIONS ═══
-function buildActivationRecos(analysis){
+function buildActivationRecos(analysis,tramosData,satLevel){
   const R=analysis.results,alcMap=analysis._alcMap;if(!alcMap)return[];
+  const satConf=SAT_LEVELS[satLevel||"no_saturada"]||SAT_LEVELS.no_saturada;
+  // Count items per local for density
+  const itemsByLocal={};R.forEach(r=>{itemsByLocal[r.local]=(itemsByLocal[r.local]||0)+1;});
   const sp={};R.forEach(r=>{if(!sp[r.local])sp[r.local]={};sp[r.local][r.item]=(sp[r.local][r.item]||0)+r.totalVenta;});
   const locals=Object.keys(sp),allItems=[...new Set(R.map(r=>r.item))];
   function cosSim(a,b){let d=0,na=0,nb=0;for(const it of allItems){const va=a[it]||0,vb=b[it]||0;d+=va*vb;na+=va*va;nb+=vb*vb;}return(na>0&&nb>0)?d/(Math.sqrt(na)*Math.sqrt(nb)):0;}
@@ -168,6 +208,9 @@ function buildActivationRecos(analysis){
   const scCount={};R.forEach(r=>{const k=r.local+"|||"+r.subClasif;scCount[k]=(scCount[k]||0)+1;});
   // Total sales per local+subClasif for cannibalization
   const scSales={};R.forEach(r=>{const k=r.local+"|||"+r.subClasif;if(!scSales[k])scSales[k]={vta:0,rent:0};scSales[k].vta+=r.totalVenta;scSales[k].rent+=r.totalRent;});
+  // Count flagged (low-perf) items per local+subClasif — these are swap candidates
+  const scFlagged={};R.forEach(r=>{const k=r.local+"|||"+r.subClasif;if(!scFlagged[k])scFlagged[k]=0;if(r.flagged&&!r.esImportado)scFlagged[k]++;});
+
   const recos=[];
   for(const loc of locals){
     const ss=simMap[loc];if(!ss||!ss.length)continue;
@@ -189,9 +232,54 @@ function buildActivationRecos(analysis){
         const netVta=aV*(1-cannibRate);
         const netRent=aR*(1-cannibRate);
         const netCant=aC*(1-cannibRate);
-        recos.push({targetLocal:loc,item,subClasif:ref.subClasif,marca:ref.marca,tamano:ref.tamano,proveedor:ref.proveedor,origen:ref.origen,storesCarrying:pis.length,avgVta:aV,avgRent:aR,avgCant:aC,avgMrg:aM,avgScore:aS,avgSim:aSim,strength:str,topStores:pis.map(p=>p.local).slice(0,3),
+
+        // Tramos/density modifier — never hard-blocks, only adjusts strength
+        let localTramos=null,density=null,tramosMod=1,densityWarning=false,swapOpportunity=false,swapReason="";
+        const nFlagged=scFlagged[scKey]||0;
+
+        if(tramosData&&tramosData[loc]){
+          localTramos=tramosData[loc];
+          const localItems=itemsByLocal[loc]||0;
+          density=localItems/localTramos;
+          if(density>5)densityWarning=true;
+
+          // Base penalty from density
+          const densityPenalty=Math.min(0.5,Math.max(0,(density-3)/10));
+          tramosMod=Math.max(0.3,satConf.actMod*(1-densityPenalty));
+
+          // Swap opportunity: there are flagged items in same local+SC that can be retired to make room
+          if(nFlagged>0){
+            // Boost back: each flagged item recovers some of the penalty (up to full recovery)
+            const swapBoost=Math.min(1.0,nFlagged*0.15);
+            tramosMod=Math.min(1.0,tramosMod+(1-tramosMod)*swapBoost);
+            swapOpportunity=true;
+            swapReason=nFlagged+" item(s) a retirar en misma SC — espacio disponible";
+          }
+
+          // Strong opportunity override: if the activation is very good, don't penalize much
+          // avgScore>=60 = top performer in similar stores, netRent strongly positive
+          if(aS>=60&&netRent>0){
+            tramosMod=Math.max(tramosMod,0.85);
+            if(!swapOpportunity)swapReason="Oportunidad fuerte (score "+aS.toFixed(0)+")";
+          }
+        }else{
+          tramosMod=satConf.actMod;
+          // Even without tramos data, note swap opportunities
+          if(nFlagged>0){swapOpportunity=true;swapReason=nFlagged+" item(s) a retirar en misma SC";}
+        }
+
+        const adjStr=str*tramosMod;
+
+        // Build reason text
+        let reasonText;
+        if(aR>0)reasonText=`Rent neta $${netRent.toFixed(2)} (${Math.round((1-cannibRate)*100)}% incr.) en ${pis.length} loc. sim.`;
+        else reasonText=`Vta neta $${netVta.toFixed(2)} en ${pis.length} loc. (score ${aS.toFixed(0)})`;
+        if(swapReason)reasonText+=` · ${swapReason}`;
+
+        recos.push({targetLocal:loc,item,subClasif:ref.subClasif,marca:ref.marca,tamano:ref.tamano,proveedor:ref.proveedor,origen:ref.origen,storesCarrying:pis.length,avgVta:aV,avgRent:aR,avgCant:aC,avgMrg:aM,avgScore:aS,avgSim:aSim,strength:adjStr,topStores:pis.map(p=>p.local).slice(0,3),
           cannibRate,netVta,netRent,netCant,itemsInSC:nItems,
-          reason:aR>0?`Rent neta $${netRent.toFixed(2)} (${Math.round((1-cannibRate)*100)}% incr.) en ${pis.length} loc. sim.`:`Vta neta $${netVta.toFixed(2)} en ${pis.length} loc. (score ${aS.toFixed(0)})`});
+          tramos:localTramos,density,tramosMod,densityWarning,swapOpportunity,nFlaggedInSC:nFlagged,
+          reason:reasonText});
       }
     }
   }
@@ -304,6 +392,15 @@ function _buildExcel(a,fd){
     ["Rent.: ganancia act. - pérdida retiro","",arRN-rf]
   );
   // By SC
+  // Saturation / Density section
+  const _td=a._tramosData,_sl=a._satLevel;
+  if(_td){
+    const _satC=SAT_LEVELS[_sl||"no_saturada"];
+    const _trLocs=Object.keys(_td);
+    const _densities=_trLocs.map(l=>{const tr=_td[l];const items=R.filter(r=>r.local===l).length;return items/tr;}).filter(d=>d>0);
+    const _avgD=_densities.length?_densities.reduce((s,d)=>s+d,0)/_densities.length:0;
+    rd.push([""],["SATURACIÓN / DENSIDAD"],["Nivel de saturación",_satC.label],["Mod. activación",_satC.actMod],["Mod. retiro",_satC.retMod],["Locales con tramos",_trLocs.length],["Densidad promedio (items/tramo)",_avgD]);
+  }
   rd.push([""],["POR SUB CLASIFICACIÓN"],["Sub Clasif.","Retiro","Vta Ret.","Rent Ret.","","Act.","Vta Neta Act.","Rent Neta Act."]);
   const bySCR={};R.forEach(r=>{if(!bySCR[r.subClasif])bySCR[r.subClasif]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[r.subClasif].fl++;bySCR[r.subClasif].vfl+=r.totalVenta;bySCR[r.subClasif].rfl+=r.totalRent;}});
   const bySCA={};(AR||[]).forEach(r=>{if(!bySCA[r.subClasif])bySCA[r.subClasif]={n:0,vNt:0,rNt:0};bySCA[r.subClasif].n++;bySCA[r.subClasif].vNt+=(r.netVta||0);bySCA[r.subClasif].rNt+=(r.netRent||0);});
@@ -375,11 +472,14 @@ function _buildExcel(a,fd){
   XLSX.utils.book_append_sheet(wb,ws5,"Sim. Retiro");
 
   // ══ 6. Activar Productos ══
-  const hA=["Local Destino","Item","Sub Clasif.","Marca","Tamaño","Proveedor","Loc. Sim.","Rent Bruta","Vta Bruta","Canib.%","Rent Neta","Vta Neta","Uds Neta","Mg%","Score","Fuerza","Razón","Loc. Ref."];
-  const dA=(AR||[]).map(r=>[r.targetLocal,r.item,r.subClasif,r.marca,r.tamano,r.proveedor,r.storesCarrying,+r.avgRent.toFixed(2),+r.avgVta.toFixed(2),(r.cannibRate||0),+(r.netRent||0).toFixed(2),+(r.netVta||0).toFixed(2),Math.round(r.netCant||0),r.avgMrg,+r.avgScore.toFixed(1),+r.strength.toFixed(1),r.reason,r.topStores.join(", ")]);
+  const hA=["Local Destino","Item","Sub Clasif.","Marca","Tamaño","Proveedor","Loc. Sim.","Rent Bruta","Vta Bruta","Canib.%","Rent Neta","Vta Neta","Uds Neta","Mg%","Score","Fuerza","Razón","Loc. Ref."].concat(_hasTramos?["Tramos","Items/Tramo","Ajuste Sat."]:[]);
+  const dA=(AR||[]).map(r=>{const row=[r.targetLocal,r.item,r.subClasif,r.marca,r.tamano,r.proveedor,r.storesCarrying,+r.avgRent.toFixed(2),+r.avgVta.toFixed(2),(r.cannibRate||0),+(r.netRent||0).toFixed(2),+(r.netVta||0).toFixed(2),Math.round(r.netCant||0),r.avgMrg,+r.avgScore.toFixed(1),+r.strength.toFixed(1),r.reason,r.topStores.join(", ")];if(_hasTramos){row.push(r.tramos||"",r.density!=null?+r.density.toFixed(1):"",r.tramosMod!=null?+r.tramosMod.toFixed(2):"");}return row;});
   const ws6=XLSX.utils.aoa_to_sheet([hA,...dA]);ws6["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:dA.length,c:hA.length-1}})};
-  ws6["!cols"]=[{wch:34},{wch:46},{wch:16},{wch:16},{wch:10},{wch:24},{wch:8},{wch:11},{wch:11},{wch:8},{wch:11},{wch:11},{wch:8},{wch:8},{wch:7},{wch:7},{wch:48},{wch:56}];
-  zCols(ws6,{6:ZI,7:ZD,8:ZD,9:ZP,10:ZD,11:ZD,12:ZI,13:ZP,14:ZS,15:ZS},1,dA.length);
+  var _aCols=[{wch:34},{wch:46},{wch:16},{wch:16},{wch:10},{wch:24},{wch:8},{wch:11},{wch:11},{wch:8},{wch:11},{wch:11},{wch:8},{wch:8},{wch:7},{wch:7},{wch:48},{wch:56}];
+  var _aFmt={6:ZI,7:ZD,8:ZD,9:ZP,10:ZD,11:ZD,12:ZI,13:ZP,14:ZS,15:ZS};
+  if(_hasTramos){_aCols.push({wch:8},{wch:10},{wch:10});_aFmt[18]=ZI;_aFmt[19]=ZS;_aFmt[20]=ZS;}
+  ws6["!cols"]=_aCols;
+  zCols(ws6,_aFmt,1,dA.length);
   XLSX.utils.book_append_sheet(wb,ws6,"Activar Productos");
 
   // ══ 7. Sim Activación (con canibalización) ══
@@ -408,19 +508,25 @@ function _buildExcel(a,fd){
   // ══ 8. Resumen Locales ══
   const byL={};R.forEach(r=>{if(!byL[r.local])byL[r.local]=[];byL[r.local].push(r);});
   const byLA={};(AR||[]).forEach(r=>{var l=r.targetLocal;if(!byLA[l])byLA[l]={n:0,vB:0,rB:0,vN:0,rN:0};byLA[l].n++;byLA[l].vB+=r.avgVta;byLA[l].rB+=r.avgRent;byLA[l].vN+=(r.netVta||0);byLA[l].rN+=(r.netRent||0);});
-  const lH=["Local","Total Items","Retirar","% Retiro","Import.","Vta Retirada","Rent Retirada","Vta Total","Rent Total","% Imp. Vta","% Imp. Rent","Activaciones","Vta Neta Act.","Rent Neta Act.","Balance Vta","Balance Rent"];
+  const _hasTramos=!!a._tramosData;
+  const lH=["Local","Total Items","Retirar","% Retiro","Import.","Vta Retirada","Rent Retirada","Vta Total","Rent Total","% Imp. Vta","% Imp. Rent","Activaciones","Vta Neta Act.","Rent Neta Act.","Balance Vta","Balance Rent"].concat(_hasTramos?["Tramos","Items/Tramo"]:[]);
   const allLK=[...new Set([...Object.keys(byL),...Object.keys(byLA)])];
   const lD=allLK.map(function(l){
     var its=byL[l]||[];var fl=its.filter(function(i){return i.flagged;});
     var vfl=fl.reduce(function(s,i){return s+i.totalVenta;},0),vtl=its.reduce(function(s,i){return s+i.totalVenta;},0);
     var rfl=fl.reduce(function(s,i){return s+i.totalRent;},0),rtl=its.reduce(function(s,i){return s+i.totalRent;},0);
     var ac=byLA[l]||{n:0,vN:0,rN:0};
-    return[l,its.length,fl.length,fl.length/(its.length||1),its.filter(function(i){return i.impFlagged;}).length,vfl,rfl,vtl,rtl,vfl/(vtl||1),rfl/(rtl||1),ac.n,ac.vN,ac.rN,ac.vN-vfl,ac.rN-rfl];
+    var row=[l,its.length,fl.length,fl.length/(its.length||1),its.filter(function(i){return i.impFlagged;}).length,vfl,rfl,vtl,rtl,vfl/(vtl||1),rfl/(rtl||1),ac.n,ac.vN,ac.rN,ac.vN-vfl,ac.rN-rfl];
+    if(_hasTramos){var _tr=a._tramosData[l];row.push(_tr||"",_tr?its.length/_tr:"");}
+    return row;
   }).sort(function(a,b){return b[2]-a[2];});
   const ws8=XLSX.utils.aoa_to_sheet([lH,...lD]);
-  ws8["!cols"]=[{wch:34},{wch:9},{wch:8},{wch:9},{wch:8},{wch:14},{wch:14},{wch:14},{wch:14},{wch:10},{wch:10},{wch:10},{wch:14},{wch:14},{wch:14},{wch:14}];
+  var _lCols=[{wch:34},{wch:9},{wch:8},{wch:9},{wch:8},{wch:14},{wch:14},{wch:14},{wch:14},{wch:10},{wch:10},{wch:10},{wch:14},{wch:14},{wch:14},{wch:14}];
+  var _lFmt={1:ZI,2:ZI,3:ZP,4:ZI,5:ZD,6:ZD,7:ZD,8:ZD,9:ZP,10:ZP,11:ZI,12:ZD,13:ZD,14:ZD,15:ZD};
+  if(_hasTramos){_lCols.push({wch:8},{wch:10});_lFmt[16]=ZI;_lFmt[17]=ZS;}
+  ws8["!cols"]=_lCols;
   ws8["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:lD.length,c:lH.length-1}})};
-  zCols(ws8,{1:ZI,2:ZI,3:ZP,4:ZI,5:ZD,6:ZD,7:ZD,8:ZD,9:ZP,10:ZP,11:ZI,12:ZD,13:ZD,14:ZD,15:ZD},1,lD.length);
+  zCols(ws8,_lFmt,1,lD.length);
   XLSX.utils.book_append_sheet(wb,ws8,"Resumen Locales");
 
   const wbout=XLSX.write(wb,{bookType:"xlsx",type:"array"});
@@ -776,6 +882,7 @@ const S={step:"upload",ventasFile:null,alcancesFile:null,analysis:null,loading:f
   nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,
   nfPanelOpen:false,sortBy:"compositeScore",sortDir:"asc",openDrop:null,dropSearch:"",page:0,PS:200,
   simLevel:"all",resDim:"subClasif",
+  satLevel:"no_saturada",tramosFile:null,tramosPreview:null,prevStep:"upload",
 };
 let allLocals=[],allSCs=[],allMarcas=[],allProvs=[];
 function ss(p){Object.assign(S,p);render();}
@@ -787,7 +894,15 @@ async function analyze(){
   try{
     const[vw,aw]=await Promise.all([readF(S.ventasFile),readF(S.alcancesFile)]);
     const vd=parseVentas(vw,S.ventasFile.name),ad=parseAlcances(aw),r=runAnalysis(vd,ad);
-    r._alcMap=ad.alcMap;r.activationRecos=buildActivationRecos(r);
+    r._alcMap=ad.alcMap;
+    const tramosData=getTramosForClasif(vd.clasificacion);
+    r._tramosData=tramosData;r._satLevel=S.satLevel;
+    // Enrich results with tramos/density per local
+    if(tramosData){
+      const itemsByLocal={};r.results.forEach(x=>{itemsByLocal[x.local]=(itemsByLocal[x.local]||0)+1;});
+      r.results.forEach(x=>{const tr=tramosData[x.local];x.tramos=tr||null;x.density=tr?itemsByLocal[x.local]/tr:null;});
+    }
+    r.activationRecos=buildActivationRecos(r,tramosData,S.satLevel);
     allLocals=[...new Set(r.results.map(x=>x.local))].sort();
     allSCs=[...new Set(r.results.map(x=>x.subClasif))].sort();
     allMarcas=[...new Set(r.results.map(x=>x.marca))].sort();
@@ -877,7 +992,7 @@ window.doExportExcel=function(){
   if(typeof XLSX==="undefined"){alert("Error: La librería XLSX no se cargó. Recarga la página.");return;}
   try{_buildExcel(S.analysis,getFiltered());}catch(e){alert("Error: "+e.message);console.error(e);}
 };
-window.resetApp=function(){ss({step:"upload",analysis:null,ventasFile:null,alcancesFile:null,selLocals:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null});};
+window.resetApp=function(){ss({step:"upload",analysis:null,ventasFile:null,alcancesFile:null,selLocals:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,satLevel:"no_saturada",tramosFile:null,tramosPreview:null});};
 window.setNF=function(f,v){const x=v===""?null:parseFloat(v);ss({[f]:isNaN(x)?null:x,page:0});};
 window.applyPreset=function(p){const pr={"conVenta":{nfVentaMin:0.01,nfVentaMax:null},"sinVenta":{nfVentaMin:null,nfVentaMax:0},"rentPos":{nfRentMin:0.01,nfRentMax:null},"rentNeg":{nfRentMin:null,nfRentMax:0},"sCrit":{nfScoreMin:null,nfScoreMax:10},"sMB":{nfScoreMin:null,nfScoreMax:20},"clear":{nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null}};if(pr[p])ss({...pr[p],page:0});};
 window.hasAnyNF=function(){return[S.nfVentaMin,S.nfVentaMax,S.nfCantMin,S.nfCantMax,S.nfRentMin,S.nfRentMax,S.nfMargenMin,S.nfMargenMax,S.nfScoreMin,S.nfScoreMax].some(v=>v!==null);};
@@ -910,15 +1025,21 @@ function pager(total,label){
 }
 
 // ═══ RENDER ═══
-function render(){const app=document.getElementById("app");if(S.step==="upload")renderUpload(app);else renderResults(app);}
+function render(){const app=document.getElementById("app");if(S.step==="upload")renderUpload(app);else if(S.step==="tramos")renderTramos(app);else renderResults(app);}
 
 function renderUpload(app){
-  app.innerHTML=`<div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">ASSORTMENT OPTIMIZER</span></div></div>
+  app.innerHTML=`<div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">ASSORTMENT OPTIMIZER</span></div><div><button class="btn btn-s btn-sm" onclick="goTramos()">⚙ Tramos</button></div></div>
   <div class="cnt fade" style="max-width:740px;padding-top:36px">
     <div style="text-align:center;margin-bottom:28px"><div style="font-size:26px;font-weight:800;letter-spacing:-.8px;margin-bottom:5px">Sube tus archivos</div><div style="font-size:12px;color:var(--tx3)">Ventas (tabla cruzada) + Alcances (Clase R). La clasificación se lee del nombre del archivo de ventas.</div></div>
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px">
       <div class="upload-zone ${S.ventasFile?"ok":""}" id="dV" onclick="document.getElementById('fV').click()"><input type="file" id="fV" accept=".xlsx,.xls" style="display:none"><div style="font-size:28px">📊</div><div style="font-size:12px;font-weight:700;color:${S.ventasFile?"var(--green)":"var(--tx2)"}">Ventas</div><div style="font-size:10px;color:${S.ventasFile?"var(--green)":"var(--tx3)"};margin-top:3px">${S.ventasFile?esc(S.ventasFile.name):"4 métricas por local"}</div></div>
       <div class="upload-zone ${S.alcancesFile?"ok":""}" id="dA" onclick="document.getElementById('fA').click()"><input type="file" id="fA" accept=".xlsx,.xls" style="display:none"><div style="font-size:28px">📋</div><div style="font-size:12px;font-weight:700;color:${S.alcancesFile?"var(--green)":"var(--tx2)"}">Alcances</div><div style="font-size:10px;color:${S.alcancesFile?"var(--green)":"var(--tx3)"};margin-top:3px">${S.alcancesFile?esc(S.alcancesFile.name):"1 = activo"}</div></div>
+    </div>
+    <div class="crd" style="margin-top:4px;padding:12px 14px">
+      <div style="font-size:9px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Nivel de Saturación de Góndola</div>
+      <div class="nf-presets">${Object.entries(SAT_LEVELS).map(([k,v])=>`<button class="nf-pre ${S.satLevel===k?"on":""}" onclick="ss({satLevel:'${k}'})" style="${S.satLevel===k?"border-color:"+v.color+";color:"+v.color:""}">${v.label}</button>`).join("")}</div>
+      <div style="font-size:9px;color:var(--tx4);margin-top:2px">Mod. activación: ${SAT_LEVELS[S.satLevel].actMod.toFixed(2)}x · Mod. retiro: ${SAT_LEVELS[S.satLevel].retMod.toFixed(2)}x</div>
+      ${(()=>{const cl=S.ventasFile?extractClasifName(S.ventasFile.name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="margin-top:8px;display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
     </div>
     ${S.error?`<div style="color:var(--red);margin-bottom:10px;font-size:12px;text-align:center">${esc(S.error)}</div>`:""}
     <div style="text-align:center"><button class="btn ${S.ventasFile&&S.alcancesFile?"btn-p":"btn-s"}" onclick="analyze()" ${S.loading||!S.ventasFile||!S.alcancesFile?"disabled":""}>${S.loading?'<span class="spin"></span> Procesando...':"Analizar Surtido"}</button></div>
@@ -930,6 +1051,97 @@ function renderUpload(app){
   document.getElementById("fV").addEventListener("change",e=>{if(e.target.files[0])ss({ventasFile:e.target.files[0],error:""});});
   document.getElementById("fA").addEventListener("change",e=>{if(e.target.files[0])ss({alcancesFile:e.target.files[0],error:""});});
   ["dV","dA"].forEach((id,i)=>{const el=document.getElementById(id);el.addEventListener("dragover",e=>{e.preventDefault();el.style.borderColor="var(--blue)";});el.addEventListener("dragleave",()=>el.style.borderColor="");el.addEventListener("drop",e=>{e.preventDefault();el.style.borderColor="";const f=e.dataTransfer.files[0];if(f)ss(i===0?{ventasFile:f,error:""}:{alcancesFile:f,error:""});});});
+}
+
+// ═══ TRAMOS CONFIG SCREEN ═══
+window.tramosUpload=async function(file){
+  try{
+    const wb=await readF(file);
+    const parsed=parseTramos(wb);
+    ss({tramosPreview:parsed,tramosFile:file,error:""});
+  }catch(e){ss({error:"Error: "+e.message,tramosPreview:null,tramosFile:null});}
+};
+window.tramosGuardar=function(){
+  if(!S.tramosPreview)return;
+  const all=loadTramos();
+  Object.entries(S.tramosPreview).forEach(([clasif,locs])=>{
+    if(!all[clasif])all[clasif]={};
+    Object.assign(all[clasif],locs);
+  });
+  saveTramos(all);
+  ss({tramosPreview:null,tramosFile:null,error:""});
+};
+window.tramosEliminar=function(clasif){
+  const all=loadTramos();delete all[clasif];saveTramos(all);render();
+};
+window.tramosLimpiar=function(){
+  localStorage.removeItem("assortOptTramos");render();
+};
+window.goTramos=function(){ss({prevStep:S.step,step:"tramos",error:""});};
+window.backFromTramos=function(){ss({step:S.prevStep||"upload",error:"",tramosPreview:null,tramosFile:null});};
+
+function renderTramos(app){
+  const all=loadTramos();
+  const clasifs=Object.keys(all).sort();
+  const totalLocs=clasifs.reduce((s,c)=>s+Object.keys(all[c]).length,0);
+
+  let previewHTML="";
+  if(S.tramosPreview){
+    const pClasifs=Object.keys(S.tramosPreview).sort();
+    previewHTML=`<div class="crd" style="border-left:3px solid var(--blue);margin-top:12px">
+      <div style="font-size:11px;font-weight:700;color:var(--blue);margin-bottom:8px">PREVIEW — ${pClasifs.length} clasificación(es) detectada(s)</div>
+      <div class="scx"><table><thead><tr><th>Clasificación</th><th>Local</th><th>Tramos</th></tr></thead><tbody>
+      ${pClasifs.map(cl=>Object.entries(S.tramosPreview[cl]).sort((a,b)=>a[0].localeCompare(b[0])).map(([loc,tr])=>`<tr><td style="font-weight:600">${esc(cl)}</td><td>${esc(loc)}</td><td class="mono">${tr}</td></tr>`).join("")).join("")}
+      </tbody></table></div>
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <button class="btn btn-p" onclick="tramosGuardar()">Guardar en localStorage</button>
+        <button class="btn btn-s" onclick="ss({tramosPreview:null,tramosFile:null})">Cancelar</button>
+      </div>
+    </div>`;
+  }
+
+  let savedHTML="";
+  if(clasifs.length){
+    savedHTML=`<div class="crd" style="margin-top:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--green)">${clasifs.length} CLASIFICACIÓN(ES) · ${totalLocs} LOCAL(ES)</div>
+        <button class="btn btn-sm" style="background:#dc2626;color:#fff;border:none" onclick="if(confirm('¿Eliminar todos los tramos?'))tramosLimpiar()">Limpiar todo</button>
+      </div>
+      ${clasifs.map(cl=>{
+        const locs=Object.entries(all[cl]).sort((a,b)=>a[0].localeCompare(b[0]));
+        return`<div style="margin-bottom:10px;padding:10px;background:var(--bg);border-radius:6px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-size:12px;font-weight:700;color:var(--yellow)">${esc(cl)} <span style="color:var(--tx3);font-weight:400;font-size:10px">(${locs.length} locales)</span></div>
+            <button class="btn btn-s btn-sm" onclick="if(confirm('¿Eliminar tramos de ${esc(cl)}?'))tramosEliminar('${esc(cl)}')">✕</button>
+          </div>
+          <div class="scx"><table><thead><tr><th>Local</th><th>Tramos</th></tr></thead><tbody>
+          ${locs.map(([loc,tr])=>`<tr><td>${esc(loc)}</td><td class="mono">${tr}</td></tr>`).join("")}
+          </tbody></table></div>
+        </div>`;
+      }).join("")}
+    </div>`;
+  }else{
+    savedHTML=`<div style="text-align:center;padding:24px;color:var(--tx4);font-size:12px;margin-top:14px">Sin tramos guardados. Sube un archivo para comenzar.</div>`;
+  }
+
+  app.innerHTML=`<div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">TRAMOS / GÓNDOLA</span></div><div><button class="btn btn-s btn-sm" onclick="backFromTramos()">← Volver</button></div></div>
+  <div class="cnt fade" style="max-width:800px;padding-top:24px">
+    <div style="text-align:center;margin-bottom:20px"><div style="font-size:20px;font-weight:800;margin-bottom:4px">Configuración de Tramos</div><div style="font-size:11px;color:var(--tx3)">Los tramos se guardan en el navegador y persisten entre sesiones. Se usan como factor complementario al analizar.</div></div>
+    <div class="upload-zone ${S.tramosFile?"ok":""}" id="dT" onclick="document.getElementById('fT').click()" style="max-width:400px;margin:0 auto">
+      <input type="file" id="fT" accept=".xlsx,.xls" style="display:none">
+      <div style="font-size:28px">📐</div>
+      <div style="font-size:12px;font-weight:700;color:${S.tramosFile?"var(--green)":"var(--tx2)"}">Archivo de Tramos</div>
+      <div style="font-size:10px;color:${S.tramosFile?"var(--green)":"var(--tx3)"};margin-top:3px">${S.tramosFile?esc(S.tramosFile.name):"Columnas: Local, Clasificación, Tramos"}</div>
+    </div>
+    ${S.error?`<div style="color:var(--red);margin-top:10px;font-size:12px;text-align:center">${esc(S.error)}</div>`:""}
+    ${previewHTML}
+    ${savedHTML}
+  </div>`;
+  document.getElementById("fT").addEventListener("change",e=>{if(e.target.files[0])tramosUpload(e.target.files[0]);});
+  const dT=document.getElementById("dT");
+  dT.addEventListener("dragover",e=>{e.preventDefault();dT.style.borderColor="var(--blue)";});
+  dT.addEventListener("dragleave",()=>dT.style.borderColor="");
+  dT.addEventListener("drop",e=>{e.preventDefault();dT.style.borderColor="";const f=e.dataTransfer.files[0];if(f)tramosUpload(f);});
 }
 
 function renderResults(app){
@@ -990,6 +1202,7 @@ function renderResults(app){
       <div class="exec-card" style="border-top:3px solid #c084fc"><h4>Rent Neta Activ.</h4><div class="exec-big" style="color:#c084fc">$${fmt(arRNeta)}</div><div class="exec-sub">Bruta $${fmt(arRBruta)}</div></div>
       <div class="exec-card" style="border-top:3px solid ${balV>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Vta.</h4><div class="exec-big" style="color:${balV>=0?"var(--green)":"var(--red)"}">$${fmt(balV)}</div><div class="exec-sub">Act. $${fmt(arVNeta)} − Ret. $${fmt(vf)}</div></div>
       <div class="exec-card" style="border-top:3px solid ${balR>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Rent.</h4><div class="exec-big" style="color:${balR>=0?"var(--green)":"var(--red)"}">$${fmt(balR)}</div><div class="exec-sub">Act. $${fmt(arRNeta)} − Ret. $${fmt(rf)}</div></div>
+      ${(()=>{const td=a._tramosData;if(!td)return"";const satC=SAT_LEVELS[a._satLevel||"no_saturada"];const locs=Object.keys(td);const densities=locs.map(l=>{const tr=td[l];const items=base.filter(r=>r.local===l).length;return items/tr;}).filter(d=>d>0);const avgD=densities.length?densities.reduce((s,d)=>s+d,0)/densities.length:0;return`<div class="exec-card" style="border-top:3px solid var(--blue)"><h4>Densidad Items/Tramo</h4><div class="exec-big" style="color:var(--blue)">${avgD.toFixed(1)}</div><div class="exec-sub">${satC.label} · ${locs.length} locales c/tramos</div></div>`;})()}
     </div>
 
     <div class="crd" style="margin-bottom:10px">
@@ -1013,7 +1226,11 @@ function renderResults(app){
         <th style="color:var(--orange)">Vta Ret.</th><th style="color:var(--purple)">Rent Ret.</th>
         <th style="color:var(--green)">Act.</th><th style="color:#2dd4bf">Vta Nt. Act.</th><th style="color:#c084fc">Rent Nt. Act.</th>
         <th>Bal. Vta</th><th>Bal. Rent</th>
-      </tr></thead><tbody>${tblData.map(d=>`<tr>
+        ${a._tramosData&&dim==="local"?`<th style="color:var(--blue)">Tramos</th><th style="color:var(--blue)">Items/Tr.</th>`:""}
+      </tr></thead><tbody>${tblData.map(d=>{
+        let tramoCols="";
+        if(a._tramosData&&dim==="local"){const tr=a._tramosData[d.key];tramoCols=tr?`<td class="mono" style="color:var(--blue)">${tr}</td><td class="mono" style="color:${(d.total/tr)>5?"var(--orange)":"var(--blue)"}">${(d.total/tr).toFixed(1)}</td>`:`<td class="mono" style="color:var(--tx4)">—</td><td class="mono" style="color:var(--tx4)">—</td>`;}
+        return`<tr>
         <td style="font-weight:600;font-size:10px;max-width:220px" class="ell" title="${esc(d.key)}">${esc(d.key)}</td>
         <td class="mono">${d.total}</td>
         <td class="mono" style="color:var(--red);font-weight:700">${d.ret}</td>
@@ -1026,7 +1243,8 @@ function renderResults(app){
         <td class="mono" style="color:#c084fc">$${fmt(d.rAct)}</td>
         <td class="mono" style="color:${d.balV>=0?"var(--green)":"var(--red)"};font-weight:700">$${fmt(d.balV)}</td>
         <td class="mono" style="color:${d.balR>=0?"var(--green)":"var(--red)"};font-weight:700">$${fmt(d.balR)}</td>
-      </tr>`).join("")}
+        ${tramoCols}
+      </tr>`;}).join("")}
       <tr style="border-top:2px solid var(--bg4);font-weight:800">
         <td>TOTAL</td><td class="mono">${tblData.reduce((s,d)=>s+d.total,0)}</td>
         <td class="mono" style="color:var(--red)">${tRet}</td><td></td><td class="mono" style="color:var(--blue)">${tblData.reduce((s,d)=>s+d.imp,0)}</td>
@@ -1034,6 +1252,7 @@ function renderResults(app){
         <td class="mono" style="color:var(--green)">${tAct}</td><td class="mono" style="color:#2dd4bf">$${fmt(tVA)}</td><td class="mono" style="color:#c084fc">$${fmt(tRA)}</td>
         <td class="mono" style="color:${(tVA-tVR)>=0?"var(--green)":"var(--red)"};font-weight:800">$${fmt(tVA-tVR)}</td>
         <td class="mono" style="color:${(tRA-tRR)>=0?"var(--green)":"var(--red)"};font-weight:800">$${fmt(tRA-tRR)}</td>
+        ${a._tramosData&&dim==="local"?`<td></td><td></td>`:""}
       </tr></tbody></table></div>
     </div>
 
@@ -1049,12 +1268,12 @@ function renderResults(app){
     const pi=pageOf(items);
     content=`<div class="dl-bar"><button class="btn btn-s btn-sm" onclick="dlCSVRetiro()">⬇ CSV Retiro (${items.length})</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel Completo</button></div>`;
     if(!items.length)content+=`<div style="text-align:center;padding:30px;color:var(--tx4)">Sin items.</div>`;
-    else{content+=`<div class="scx"><table><thead><tr><th>Sev.</th>${TH2("local","Local")}${TH2("subClasif","Sub Cl.")}${TH2("item","Item")}<th>Tam.</th>${TH2("marca","Marca")}<th>Prov.</th>${TH2("totalVenta","Vta$")}${TH2("totalCant","Uds")}${TH2("totalRent","Rent$")}${TH2("avgMargen","Mg%")}${TH2("pSales","%Vta")}${TH2("pUnits","%Uds")}${TH2("pRent","%Rnt")}${TH2("pMargin","%Mg")}${TH2("compositeScore","Score")}<th>Razones</th><th>N</th></tr></thead><tbody>${pi.map(it=>`<tr>
+    else{content+=`<div class="scx"><table><thead><tr><th>Sev.</th>${TH2("local","Local")}${TH2("subClasif","Sub Cl.")}${TH2("item","Item")}<th>Tam.</th>${TH2("marca","Marca")}<th>Prov.</th>${TH2("totalVenta","Vta$")}${TH2("totalCant","Uds")}${TH2("totalRent","Rent$")}${TH2("avgMargen","Mg%")}${TH2("pSales","%Vta")}${TH2("pUnits","%Uds")}${TH2("pRent","%Rnt")}${TH2("pMargin","%Mg")}${TH2("compositeScore","Score")}${a._tramosData?TH2("density","Densidad"):""}<th>Razones</th><th>N</th></tr></thead><tbody>${pi.map(it=>`<tr>
       <td>${bdg(it.compositeScore)}</td><td class="ell" style="max-width:140px;font-size:10px" title="${esc(it.local)}">${esc(it.local)}</td><td style="font-size:9px">${esc(it.subClasif)}</td><td class="ell" style="max-width:180px" title="${esc(it.item)}">${esc(it.item)}</td><td style="font-size:9px">${esc(it.tamano)}</td><td style="color:var(--yellow);font-size:10px">${esc(it.marca)}</td><td style="font-size:9px;color:var(--tx4)">${esc(it.proveedor).substring(0,18)}</td>
       <td class="mono" style="font-size:10px">$${fmt(it.totalVenta)}</td><td class="mono" style="font-size:10px">${fI(it.totalCant)}</td><td class="mono" style="font-size:10px">$${fmt(it.totalRent)}</td><td class="mono" style="font-size:10px;color:${it.avgMargen<0?"var(--red)":"var(--tx2)"}">${(it.avgMargen*100).toFixed(1)}%</td>
       <td>${bar(it.pSales)}</td><td>${bar(it.pUnits)}</td><td>${bar(it.pRent)}</td><td>${bar(it.pMargin)}</td>
       <td class="mono" style="font-weight:700;font-size:11px;color:${it.compositeScore<15?"var(--red)":"var(--orange)"}">${fS(it.compositeScore)}</td>
-      <td>${it.reasons.map(r=>`<span class="tag">${esc(r)}</span>`).join("")}</td><td class="mono" style="font-size:9px;color:var(--tx4)">${it.groupSize}</td>
+      ${a._tramosData?`<td class="mono" style="font-size:10px;color:${it.density&&it.density>5?"var(--orange)":"var(--tx3)"}">${it.density!=null?it.density.toFixed(1):"—"}</td>`:""}<td>${it.reasons.map(r=>`<span class="tag">${esc(r)}</span>`).join("")}</td><td class="mono" style="font-size:9px;color:var(--tx4)">${it.groupSize}</td>
     </tr>`).join("")}</tbody></table></div>${pager(items.length,"items")}`;}
   }
 
@@ -1130,12 +1349,14 @@ function renderResults(app){
       <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tNR)}</div><div class="stat-l">Rent neta</div></div>
       <div class="stat"><div class="stat-v" style="color:var(--tx3)">~${(avgCn*100).toFixed(0)}%</div><div class="stat-l">Canib. prom.</div></div>
     </div>
+    ${(()=>{const sl=a._satLevel?SAT_LEVELS[a._satLevel]:null;const hasSwaps=recos.some(r=>r.swapOpportunity);if(!sl||a._satLevel==="no_saturada")return hasSwaps?`<div class="info-b info-green"><div style="font-size:10px;color:var(--green)"><span style="font-size:12px">⇄</span> = hay items de bajo rendimiento en la misma SC del local que se pueden retirar para dar espacio.</div></div>`:"";return`<div class="info-b info-amber"><div style="font-size:10px;color:var(--orange)">Saturación: <strong>${sl.label}</strong> — La fuerza de activación se ajusta por densidad y saturación.</div><div style="font-size:9px;color:var(--tx3);margin-top:3px"><span style="color:var(--orange)">●</span> = alta densidad · <span style="color:var(--green)">⇄</span> = swap posible (items a retirar liberan espacio) · Oportunidades fuertes (score≥60) o con swap disponible no se penalizan tanto.</div></div>`;})()}
     ${!recos.length?`<div style="text-align:center;padding:30px;color:var(--tx4)">Sin recomendaciones.</div>`:`
-    <div class="scx"><table><thead><tr>${TH2("targetLocal","Local Dest.")}${TH2("item","Item")}${TH2("subClasif","Sub Cl.")}${TH2("marca","Marca")}<th>Tam.</th>${TH2("storesCarrying","Loc.")}${TH2("netRent","Rent Nt.")}${TH2("netVta","Vta Nt.")}${TH2("netCant","Uds Nt.")}${TH2("avgMrg","Mg%")}${TH2("cannibRate","Canib.")}${TH2("avgScore","Score")}${TH2("strength","Fuerza")}<th>Razón</th><th>Loc. Ref.</th></tr></thead><tbody>${pr.map(r=>`<tr>
-      <td class="ell" style="max-width:140px;font-size:10px" title="${esc(r.targetLocal)}">${esc(r.targetLocal)}</td>
+    <div class="scx"><table><thead><tr>${TH2("targetLocal","Local Dest.")}${TH2("item","Item")}${TH2("subClasif","Sub Cl.")}${TH2("marca","Marca")}<th>Tam.</th>${TH2("storesCarrying","Loc.")}${a._tramosData?`${TH2("tramos","Tramos")}${TH2("density","It/Tr.")}`:""} ${TH2("netRent","Rent Nt.")}${TH2("netVta","Vta Nt.")}${TH2("netCant","Uds Nt.")}${TH2("avgMrg","Mg%")}${TH2("cannibRate","Canib.")}${TH2("avgScore","Score")}${TH2("strength","Fuerza")}<th>Razón</th><th>Loc. Ref.</th></tr></thead><tbody>${pr.map(r=>`<tr>
+      <td class="ell" style="max-width:140px;font-size:10px" title="${esc(r.targetLocal)}">${r.densityWarning?`<span style="color:var(--orange)" title="Alta densidad">●</span> `:""}${r.swapOpportunity?`<span style="color:var(--green)" title="${esc(r.nFlaggedInSC+' items a retirar — swap')}">⇄</span> `:""}${esc(r.targetLocal)}</td>
       <td class="ell" style="max-width:180px" title="${esc(r.item)}">${esc(r.item)}</td>
       <td style="font-size:9px">${esc(r.subClasif)}</td><td style="color:var(--yellow);font-size:10px">${esc(r.marca)}</td><td style="font-size:9px">${esc(r.tamano||"")}</td>
       <td class="mono" style="text-align:center;color:var(--green);font-weight:700">${r.storesCarrying}</td>
+      ${a._tramosData?`<td class="mono" style="color:var(--blue)">${r.tramos||"—"}</td><td class="mono" style="color:${r.density&&r.density>5?"var(--orange)":"var(--blue)"}">${r.density!=null?r.density.toFixed(1):"—"}${r.swapOpportunity&&r.densityWarning?`<span style="color:var(--green);font-size:8px" title="Swap: ${r.nFlaggedInSC} retiro(s)"> ⇄</span>`:""}</td>`:""}
       <td class="mono" style="font-size:10px;color:${(r.netRent||0)>0?"var(--green)":"var(--red)"}">$${fmt(r.netRent||0)}</td>
       <td class="mono" style="font-size:10px">$${fmt(r.netVta||0)}</td>
       <td class="mono" style="font-size:10px">${fI(r.netCant||0)}</td>
@@ -1189,7 +1410,7 @@ function renderResults(app){
   const clrAll=`ss({selLocals:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:'',page:0,nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null})`;
 
   app.innerHTML=`
-    <div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">${CL?CL+" — ":""}ASSORTMENT OPTIMIZER</span><span style="font-size:10px;color:var(--tx4);margin-left:8px">${base.length.toLocaleString()} items${aF>0?" (filtrado)":""} · ${new Set(base.map(r=>r.local)).size} loc · Sub clasif: ${new Set(base.map(r=>r.subClasif)).size}</span></div><div style="display:flex;gap:6px"><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel</button><button class="btn btn-sm" style="background:#7c3aed;color:#fff;border:none" onclick="doExportPPTX()">⬇ Presentación</button><button class="btn btn-s btn-sm" onclick="resetApp()">Nuevo</button></div></div>
+    <div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">${CL?CL+" — ":""}ASSORTMENT OPTIMIZER</span><span style="font-size:10px;color:var(--tx4);margin-left:8px">${base.length.toLocaleString()} items${aF>0?" (filtrado)":""} · ${new Set(base.map(r=>r.local)).size} loc · Sub clasif: ${new Set(base.map(r=>r.subClasif)).size}</span></div><div style="display:flex;gap:6px"><button class="btn btn-s btn-sm" onclick="goTramos()">⚙ Tramos</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel</button><button class="btn btn-sm" style="background:#7c3aed;color:#fff;border:none" onclick="doExportPPTX()">⬇ Presentación</button><button class="btn btn-s btn-sm" onclick="resetApp()">Nuevo</button></div></div>
     <div class="cnt">
       <div class="fbar">
         ${multiSel("locals","LOCAL",allLocals,S.selLocals,"Locales...")}
