@@ -906,6 +906,7 @@ const S={step:"upload",ventasFile:null,alcancesFile:null,analysis:null,loading:f
   nfPanelOpen:false,sortBy:"compositeScore",sortDir:"asc",openDrop:null,dropSearch:"",page:0,PS:200,
   simLevel:"all",resDim:"subClasif",
   satLevel:"no_saturada",tramosFile:null,tramosPreview:null,prevStep:"upload",
+  execSort:"ret",execDir:"desc",
 };
 let allLocals=[],allClasifs=[],allSCs=[],allMarcas=[],allProvs=[];
 function ss(p){Object.assign(S,p);render();}
@@ -937,8 +938,11 @@ async function analyze(){
 
 // ── Sorting (global, works on all tabs) ──
 function hSort(col){if(S.sortBy===col)ss({sortDir:S.sortDir==="asc"?"desc":"asc",page:0});else ss({sortBy:col,sortDir:"asc",page:0});}
+function hExecSort(col){if(S.execSort===col)ss({execDir:S.execDir==="asc"?"desc":"asc"});else ss({execSort:col,execDir:"desc"});}
 function sI(c){return S.sortBy===c?(S.sortDir==="asc"?" ▲":" ▼"):"";}
 function sC(c){return S.sortBy===c?"sorted":"";}
+function eI(c){return S.execSort===c?(S.execDir==="asc"?" ▲":" ▼"):"";}
+function eC(c){return S.execSort===c?"sorted":"";}
 function doSort(arr){const d=S.sortDir==="asc"?1:-1;const k=S.sortBy;return arr.slice().sort((a,b)=>{const av=a[k],bv=b[k];if(typeof av==="string")return(av||"").localeCompare(bv||"")*d;return((av||0)-(bv||0))*d;});}
 
 function matchRange(v,mi,ma){if(mi!==null&&v<mi)return false;if(ma!==null&&v>ma)return false;return true;}
@@ -1192,6 +1196,7 @@ function renderResults(app){
   // ── EXEC ──
   if(S.tab==="exec"){
     const F=base.filter(i=>i.flagged),vt=base.reduce((s,r)=>s+r.totalVenta,0),vf=F.reduce((s,r)=>s+r.totalVenta,0),rt=base.reduce((s,r)=>s+r.totalRent,0),rf=F.reduce((s,r)=>s+r.totalRent,0);
+    const vtAll=a.results.reduce((s,r)=>s+r.totalVenta,0),rtAll=a.results.reduce((s,r)=>s+r.totalRent,0);
     const crit=F.filter(x=>x.severity==="CRITICO"),muyB=F.filter(x=>x.severity==="MUY_BAJO");
     const AR=recos;
     const arVBruta=AR.reduce((s,r)=>s+r.avgVta,0),arRBruta=AR.reduce((s,r)=>s+r.avgRent,0);
@@ -1214,7 +1219,8 @@ function renderResults(app){
     AR.forEach(r=>{const k=r[recoDimField];if(!byDimA[k])byDimA[k]={n:0,vNt:0,rNt:0};const o=byDimA[k];o.n++;o.vNt+=(r.netVta||0);o.rNt+=(r.netRent||0);});
     // Merge
     const allDimKeys=[...new Set([...Object.keys(byDimR),...Object.keys(byDimA)])];
-    let tblData=allDimKeys.map(k=>{const r=byDimR[k]||{t:0,fl:0,vfl:0,rfl:0,vtot:0,rtot:0,imp:0};const ac=byDimA[k]||{n:0,vNt:0,rNt:0};return{key:k,total:r.t,ret:r.fl,pRet:r.fl/(r.t||1),imp:r.imp,vRet:r.vfl,rRet:r.rfl,vTot:r.vtot,rTot:r.rtot,act:ac.n,vAct:ac.vNt,rAct:ac.rNt,balV:ac.vNt-r.vfl,balR:ac.rNt-r.rfl};}).sort((a,b)=>b.ret-a.ret);
+    let tblData=allDimKeys.map(k=>{const r=byDimR[k]||{t:0,fl:0,vfl:0,rfl:0,vtot:0,rtot:0,imp:0};const ac=byDimA[k]||{n:0,vNt:0,rNt:0};return{key:k,total:r.t,ret:r.fl,pRet:r.fl/(r.t||1),imp:r.imp,vRet:r.vfl,rRet:r.rfl,vTot:r.vtot,rTot:r.rtot,act:ac.n,vAct:ac.vNt,rAct:ac.rNt,balV:ac.vNt-r.vfl,balR:ac.rNt-r.rfl};});
+    {const ek=S.execSort||"ret",ed=S.execDir==="asc"?1:-1;tblData.sort((a,b)=>{const av=a[ek],bv=b[ek];if(typeof av==="string")return(av||"").localeCompare(bv||"")*ed;return((av||0)-(bv||0))*ed;});}
     // Totals
     const tRet=tblData.reduce((s,d)=>s+d.ret,0),tAct=tblData.reduce((s,d)=>s+d.act,0);
     const tVR=tblData.reduce((s,d)=>s+d.vRet,0),tRR=tblData.reduce((s,d)=>s+d.rRet,0);
@@ -1224,8 +1230,8 @@ function renderResults(app){
     <div class="exec">
       <div class="exec-card" style="border-top:3px solid var(--tx)"><h4>Analizados</h4><div class="exec-big">${base.length.toLocaleString()}</div><div class="exec-sub">${uI} SKUs · ${new Set(base.map(r=>r.local)).size} locales${a.isMultiClasif?" · "+a.clasificaciones.length+" clasif.":""} · ${new Set(base.map(r=>r.subClasif)).size} sub clasif.</div></div>
       <div class="exec-card" style="border-top:3px solid var(--red)"><h4>Retiro Alcances</h4><div class="exec-big" style="color:var(--red)">${F.length.toLocaleString()}</div><div class="exec-sub">${crit.length} crít. · ${muyB.length} m.bajo · ${F.length-crit.length-muyB.length} bajo</div></div>
-      <div class="exec-card" style="border-top:3px solid var(--orange)"><h4>Venta Perdida</h4><div class="exec-big" style="color:var(--orange)">$${fmt(vf)}</div><div class="exec-sub">${fP(vf/vt)} de $${fmt(vt)}</div></div>
-      <div class="exec-card" style="border-top:3px solid var(--purple)"><h4>Rent. Perdida</h4><div class="exec-big" style="color:var(--purple)">$${fmt(rf)}</div><div class="exec-sub">${fP(rf/rt)} de $${fmt(rt)}</div></div>
+      <div class="exec-card" style="border-top:3px solid var(--orange)"><h4>Venta Perdida</h4><div class="exec-big" style="color:var(--orange)">$${fmt(vf)}</div><div class="exec-sub">${fP(vf/vtAll)} de $${fmt(vtAll)}</div></div>
+      <div class="exec-card" style="border-top:3px solid var(--purple)"><h4>Rent. Perdida</h4><div class="exec-big" style="color:var(--purple)">$${fmt(rf)}</div><div class="exec-sub">${fP(rf/rtAll)} de $${fmt(rtAll)}</div></div>
       <div class="exec-card" style="border-top:3px solid var(--green)"><h4>Activación</h4><div class="exec-big" style="color:var(--green)">${AR.length.toLocaleString()}</div><div class="exec-sub">${new Set(AR.map(r=>r.item)).size} SKUs · ${new Set(AR.map(r=>r.targetLocal)).size} locales</div></div>
       <div class="exec-card" style="border-top:3px solid #2dd4bf"><h4>Vta Neta Activ.</h4><div class="exec-big" style="color:#2dd4bf">$${fmt(arVNeta)}</div><div class="exec-sub">Bruta $${fmt(arVBruta)} · Canib. ~${(avgCannib*100).toFixed(0)}%</div></div>
       <div class="exec-card" style="border-top:3px solid #c084fc"><h4>Rent Neta Activ.</h4><div class="exec-big" style="color:#c084fc">$${fmt(arRNeta)}</div><div class="exec-sub">Bruta $${fmt(arRBruta)}</div></div>
@@ -1250,11 +1256,11 @@ function renderResults(app){
         <div class="stat"><div class="stat-v" style="color:${(tRA-tRR)>=0?"var(--green)":"var(--red)"}">$${fmt(tRA-tRR)}</div><div class="stat-l">Bal. Rent</div></div>
       </div>
       <div class="scx"><table><thead><tr>
-        <th>${dimLabel}</th><th>Total</th>
-        <th style="color:var(--red)">Ret.</th><th>% Ret.</th><th style="color:var(--blue)">Imp.</th>
-        <th style="color:var(--orange)">Vta Ret.</th><th style="color:var(--purple)">Rent Ret.</th>
-        <th style="color:var(--green)">Act.</th><th style="color:#2dd4bf">Vta Nt. Act.</th><th style="color:#c084fc">Rent Nt. Act.</th>
-        <th>Bal. Vta</th><th>Bal. Rent</th>
+        <th class="${eC("key")}" onclick="hExecSort('key')">${dimLabel}${eI("key")}</th><th class="${eC("total")}" onclick="hExecSort('total')">Total${eI("total")}</th>
+        <th class="${eC("ret")}" style="color:var(--red)" onclick="hExecSort('ret')">Ret.${eI("ret")}</th><th class="${eC("pRet")}" onclick="hExecSort('pRet')">% Ret.${eI("pRet")}</th><th class="${eC("imp")}" style="color:var(--blue)" onclick="hExecSort('imp')">Imp.${eI("imp")}</th>
+        <th class="${eC("vRet")}" style="color:var(--orange)" onclick="hExecSort('vRet')">Vta Ret.${eI("vRet")}</th><th class="${eC("rRet")}" style="color:var(--purple)" onclick="hExecSort('rRet')">Rent Ret.${eI("rRet")}</th>
+        <th class="${eC("act")}" style="color:var(--green)" onclick="hExecSort('act')">Act.${eI("act")}</th><th class="${eC("vAct")}" style="color:#2dd4bf" onclick="hExecSort('vAct')">Vta Nt. Act.${eI("vAct")}</th><th class="${eC("rAct")}" style="color:#c084fc" onclick="hExecSort('rAct')">Rent Nt. Act.${eI("rAct")}</th>
+        <th class="${eC("balV")}" onclick="hExecSort('balV')">Bal. Vta${eI("balV")}</th><th class="${eC("balR")}" onclick="hExecSort('balR')">Bal. Rent${eI("balR")}</th>
         ${a._tramosData&&dim==="local"?`<th style="color:var(--blue)">Tramos</th><th style="color:var(--blue)">Items/Tr.</th>`:""}
       </tr></thead><tbody>${tblData.map(d=>{
         let tramoCols="";
