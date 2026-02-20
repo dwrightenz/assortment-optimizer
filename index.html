@@ -163,10 +163,27 @@ function parseVentas(wb,filename){
 function parseAlcances(wb){
   const ws=wb.Sheets[wb.SheetNames[0]],rng=XLSX.utils.decode_range(ws["!ref"]);
   const c=(r,col)=>{const a=XLSX.utils.encode_cell({r,c:col});return ws[a]?ws[a].v:null;};
-  const locs=[];for(let i=1;i<=rng.e.c;i++){const n=(c(0,i)||"").toString().trim();if(n)locs.push({col:i,name:n});}
-  const m={};
-  for(let r=2;r<=rng.e.r;r++){const it=(c(r,0)||"").toString().trim();if(!it)continue;const s=new Set();for(const l of locs)if(c(r,l.col)===1)s.add(l.name);m[it]=s;}
-  return{alcMap:m};
+  const cell=(r,col)=>{const a=XLSX.utils.encode_cell({r,c:col});return ws[a]||null;};
+  // Detect date column at col B (check rows 0 and 1 for "fec"/"fecha"/"inicio")
+  const h0=(c(0,1)||"").toString().toLowerCase(),h1=(c(1,1)||"").toString().toLowerCase();
+  const hasDate=/(fec|fecha|inicio)/.test(h0)||/(fec|fecha|inicio)/.test(h1);
+  const locStart=hasDate?2:1;
+  const locs=[];for(let i=locStart;i<=rng.e.c;i++){const n=(c(0,i)||"").toString().trim();if(n)locs.push({col:i,name:n});}
+  const m={},alcDates={};
+  for(let r=2;r<=rng.e.r;r++){
+    const it=(c(r,0)||"").toString().trim();if(!it)continue;
+    // Parse date from col B if present
+    let dt=null;
+    if(hasDate){const dc=cell(r,1);if(dc){if(dc.t==='d')dt=new Date(dc.v);else if(dc.t==='n'&&dc.v)dt=new Date((dc.v-25569)*86400000);else if(dc.t==='s'&&dc.v){const p=Date.parse(dc.v);if(!isNaN(p))dt=new Date(p);}}}
+    if(!m[it])m[it]=new Set();
+    for(const l of locs){
+      if(c(r,l.col)===1){
+        m[it].add(l.name);
+        if(dt){if(!alcDates[it])alcDates[it]={};if(!alcDates[it][l.name]||dt<alcDates[it][l.name])alcDates[it][l.name]=dt;}
+      }
+    }
+  }
+  return{alcMap:m,alcDates};
 }
 
 // ═══ ANALYSIS ═══
@@ -175,15 +192,23 @@ function runAnalysis(vd,ad){
   const fil=vd.items.filter(r=>ak.has(r.item)&&ad.alcMap[r.item].has(r.local));
   // Group key includes clasificacion for multi-clasif support
   const grp={};fil.forEach(r=>{const k=r.local+"|||"+(r.clasificacion||"")+"|||"+r.subClasif+"|||"+r.item;if(!grp[k])grp[k]=[];grp[k].push(r);});
-  const sums=Object.values(grp).map(recs=>{const f=recs[0];let vS=0,cS=0,rS=0,mS=0;recs.forEach(r=>{vS+=r.ventaUSD;cS+=r.cantidad;rS+=r.rentabilidad;mS+=r.margen;});return{...f,totalVenta:vS,totalCant:cS,totalRent:rS,avgMargen:mS/recs.length};});
+  const sums0=Object.values(grp).map(recs=>{const f=recs[0];let vS=0,cS=0,rS=0,mS=0;recs.forEach(r=>{vS+=r.ventaUSD;cS+=r.cantidad;rS+=r.rentabilidad;mS+=r.margen;});
+    // Calculate mesesActivos from alcDates
+    let mesesActivos=12;
+    if(ad.alcDates&&ad.alcDates[f.item]&&ad.alcDates[f.item][f.local]){const dt=ad.alcDates[f.item][f.local];const yr=dt.getFullYear();if(yr<2025)mesesActivos=12;else if(yr===2025)mesesActivos=Math.max(1,12-dt.getMonth());else mesesActivos=1;}
+    return{...f,totalVenta:vS,totalCant:cS,totalRent:rS,avgMargen:mS/recs.length,mesesActivos};});
+  // Filter out items with < 4 meses activos
+  const sums=sums0.filter(s=>s.mesesActivos>=4);
+  // Monthly averages
+  sums.forEach(s=>{s.vtaPromMes=s.totalVenta/s.mesesActivos;s.cantPromMes=s.totalCant/s.mesesActivos;s.rentPromMes=s.totalRent/s.mesesActivos;});
   // Percentile groups: local + clasificacion + subClasif (items compared within their classification)
   const bg={};sums.forEach(s=>{const k=s.local+"|||"+(s.clasificacion||"")+"|||"+s.subClasif;if(!bg[k])bg[k]=[];bg[k].push(s);});
   const res=[],bf={};
   Object.values(bg).forEach(items=>{
     if(items.length<2)return;
-    const sA=items.map(i=>i.totalVenta),uA=items.map(i=>i.totalCant),rA=items.map(i=>i.totalRent),mA=items.map(i=>i.avgMargen);
+    const sA=items.map(i=>i.vtaPromMes),uA=items.map(i=>i.cantPromMes),rA=items.map(i=>i.rentPromMes),mA=items.map(i=>i.avgMargen);
     items.forEach(it=>{
-      const pS=pctRank(sA,it.totalVenta),pU=pctRank(uA,it.totalCant),pR=pctRank(rA,it.totalRent),pM=pctRank(mA,it.avgMargen);
+      const pS=pctRank(sA,it.vtaPromMes),pU=pctRank(uA,it.cantPromMes),pR=pctRank(rA,it.rentPromMes),pM=pctRank(mA,it.avgMargen);
       const cs=W.sales*pS+W.units*pU+W.profitability*pR+W.margin*pM;
       const fl=cs<TH&&!it.esImportado,ifl=cs<TH&&it.esImportado;
       const rz=[];if(pS<TH)rz.push("Baja venta");if(pU<TH)rz.push("Baja rotación");if(pR<TH)rz.push("Baja rent.");if(pM<20)rz.push("Bajo margen");
@@ -218,11 +243,11 @@ function buildActivationRecos(analysis,tramosData,satLevel){
   const satConf=SAT_LEVELS[satLevel||"no_saturada"]||SAT_LEVELS.no_saturada;
   // Count items per local for density
   const itemsByLocal={};R.forEach(r=>{itemsByLocal[r.local]=(itemsByLocal[r.local]||0)+1;});
-  const sp={};R.forEach(r=>{if(!sp[r.local])sp[r.local]={};sp[r.local][r.item]=(sp[r.local][r.item]||0)+r.totalVenta;});
+  const sp={};R.forEach(r=>{if(!sp[r.local])sp[r.local]={};sp[r.local][r.item]=(sp[r.local][r.item]||0)+r.vtaPromMes;});
   const locals=Object.keys(sp),allItems=[...new Set(R.map(r=>r.item))];
   function cosSim(a,b){let d=0,na=0,nb=0;for(const it of allItems){const va=a[it]||0,vb=b[it]||0;d+=va*vb;na+=va*va;nb+=vb*vb;}return(na>0&&nb>0)?d/(Math.sqrt(na)*Math.sqrt(nb)):0;}
   const simMap={};for(const loc of locals){const sims=[];for(const o of locals){if(o===loc)continue;sims.push({local:o,sim:cosSim(sp[loc],sp[o])});}sims.sort((a,b)=>b.sim-a.sim);simMap[loc]=sims.slice(0,5).filter(s=>s.sim>.3);}
-  const ip={};R.forEach(r=>{if(!ip[r.item])ip[r.item]={};ip[r.item][r.local]={vta:r.totalVenta,rent:r.totalRent,cant:r.totalCant,mrg:r.avgMargen,score:r.compositeScore,clasificacion:r.clasificacion||"",subClasif:r.subClasif,marca:r.marca,tamano:r.tamano,proveedor:r.proveedor,origen:r.origen};});
+  const ip={};R.forEach(r=>{if(!ip[r.item])ip[r.item]={};ip[r.item][r.local]={vta:r.vtaPromMes,rent:r.rentPromMes,cant:r.cantPromMes,mrg:r.avgMargen,score:r.compositeScore,clasificacion:r.clasificacion||"",subClasif:r.subClasif,marca:r.marca,tamano:r.tamano,proveedor:r.proveedor,origen:r.origen};});
   // Count items per local+clasificacion+subClasif for cannibalization
   const scCount={};R.forEach(r=>{const k=r.local+"|||"+(r.clasificacion||"")+"|||"+r.subClasif;scCount[k]=(scCount[k]||0)+1;});
   // Total sales per local+clasificacion+subClasif for cannibalization
@@ -308,17 +333,19 @@ function buildActivationRecos(analysis,tramosData,satLevel){
 // ═══ SIMULATION ═══
 function simulate(results,level){
   const R=results,totV=R.reduce((s,r)=>s+r.totalVenta,0),totR=R.reduce((s,r)=>s+r.totalRent,0),totU=R.reduce((s,r)=>s+r.totalCant,0);
+  const totVM=R.reduce((s,r)=>s+(r.vtaPromMes||0),0),totRM=R.reduce((s,r)=>s+(r.rentPromMes||0),0);
   let rem;
   if(level==="all")rem=R.filter(r=>r.flagged);else if(level==="critico")rem=R.filter(r=>r.flagged&&r.severity==="CRITICO");else if(level==="muy_bajo")rem=R.filter(r=>r.flagged&&(r.severity==="CRITICO"||r.severity==="MUY_BAJO"));else rem=[];
   const rV=rem.reduce((s,r)=>s+r.totalVenta,0),rR=rem.reduce((s,r)=>s+r.totalRent,0),rU=rem.reduce((s,r)=>s+r.totalCant,0);
+  const rVM=rem.reduce((s,r)=>s+(r.vtaPromMes||0),0),rRM=rem.reduce((s,r)=>s+(r.rentPromMes||0),0),rUM=rem.reduce((s,r)=>s+(r.cantPromMes||0),0);
   const bySC={},byMarca={},byProv={};
   rem.forEach(r=>{
-    if(!bySC[r.subClasif])bySC[r.subClasif]={n:0,vta:0,rent:0};bySC[r.subClasif].n++;bySC[r.subClasif].vta+=r.totalVenta;bySC[r.subClasif].rent+=r.totalRent;
-    if(!byMarca[r.marca])byMarca[r.marca]={n:0,vta:0,rent:0};byMarca[r.marca].n++;byMarca[r.marca].vta+=r.totalVenta;byMarca[r.marca].rent+=r.totalRent;
-    if(!byProv[r.proveedor])byProv[r.proveedor]={n:0,vta:0,rent:0};byProv[r.proveedor].n++;byProv[r.proveedor].vta+=r.totalVenta;byProv[r.proveedor].rent+=r.totalRent;
+    if(!bySC[r.subClasif])bySC[r.subClasif]={n:0,vta:0,rent:0,vtaM:0,rentM:0};bySC[r.subClasif].n++;bySC[r.subClasif].vta+=r.totalVenta;bySC[r.subClasif].rent+=r.totalRent;bySC[r.subClasif].vtaM+=(r.vtaPromMes||0);bySC[r.subClasif].rentM+=(r.rentPromMes||0);
+    if(!byMarca[r.marca])byMarca[r.marca]={n:0,vta:0,rent:0,vtaM:0,rentM:0};byMarca[r.marca].n++;byMarca[r.marca].vta+=r.totalVenta;byMarca[r.marca].rent+=r.totalRent;byMarca[r.marca].vtaM+=(r.vtaPromMes||0);byMarca[r.marca].rentM+=(r.rentPromMes||0);
+    if(!byProv[r.proveedor])byProv[r.proveedor]={n:0,vta:0,rent:0,vtaM:0,rentM:0};byProv[r.proveedor].n++;byProv[r.proveedor].vta+=r.totalVenta;byProv[r.proveedor].rent+=r.totalRent;byProv[r.proveedor].vtaM+=(r.vtaPromMes||0);byProv[r.proveedor].rentM+=(r.rentPromMes||0);
   });
-  return{totV,totR,totU,totN:R.length,rV,rR,rU,rN:rem.length,bySC,byMarca,byProv,uI:new Set(rem.map(r=>r.item)).size,uL:new Set(rem.map(r=>r.local)).size,
-    pV:rV/(totV||1),pR:rR/(totR||1),pU:rU/(totU||1),pN:rem.length/(R.length||1),aV:totV-rV,aR:totR-rR};
+  return{totV,totR,totU,totN:R.length,totVM,totRM,rV,rR,rU,rN:rem.length,rVM,rRM,rUM,bySC,byMarca,byProv,uI:new Set(rem.map(r=>r.item)).size,uL:new Set(rem.map(r=>r.local)).size,
+    pV:rV/(totV||1),pR:rR/(totR||1),pU:rU/(totU||1),pN:rem.length/(R.length||1),aV:totV-rV,aR:totR-rR,aVM:totVM-rVM,aRM:totRM-rRM};
 }
 
 // ═══ FILE DOWNLOAD HELPERS ═══
@@ -373,8 +400,8 @@ function _buildExcel(a,fd){
   const ZD='$#,##0.00',ZI='#,##0',ZP='0.0%',ZS='0.0';
   function zCol(ws,col,zf,r0,r1){for(var r=r0;r<=r1;r++){var ref=XLSX.utils.encode_cell({r:r,c:col});if(ws[ref]&&ws[ref].t==='n')ws[ref].z=zf;}}
   function zCols(ws,mp,r0,r1){for(var c in mp)zCol(ws,+c,mp[c],r0,r1);}
-  const vt=R.reduce((s,r)=>s+r.totalVenta,0),vf=F.reduce((s,r)=>s+r.totalVenta,0);
-  const rt=R.reduce((s,r)=>s+r.totalRent,0),rf=F.reduce((s,r)=>s+r.totalRent,0);
+  const vt=R.reduce((s,r)=>s+r.vtaPromMes,0),vf=F.reduce((s,r)=>s+r.vtaPromMes,0);
+  const rt=R.reduce((s,r)=>s+r.rentPromMes,0),rf=F.reduce((s,r)=>s+r.rentPromMes,0);
   const crit=F.filter(x=>x.severity==="CRITICO"),muyB=F.filter(x=>x.severity==="MUY_BAJO");
   const arVN=(AR||[]).reduce((s,r)=>s+(r.netVta||0),0),arRN=(AR||[]).reduce((s,r)=>s+(r.netRent||0),0);
   const arVB=(AR||[]).reduce((s,r)=>s+r.avgVta,0),arRB=(AR||[]).reduce((s,r)=>s+r.avgRent,0);
@@ -389,28 +416,28 @@ function _buildExcel(a,fd){
   const hasF=fDesc.length>0;
 
   // ══ 1. RESUMEN EJECUTIVO ══
-  const rd=[["ANÁLISIS DE SURTIDO"+(CL?" — "+CL:"")],[""]];
+  const rd=[["ANÁLISIS DE SURTIDO"+(CL?" — "+CL:"")+" (Promedios Mensuales)"],[""]];
   if(hasF){rd.push(["FILTROS APLICADOS"]);fDesc.forEach(f=>rd.push(["  "+f]));rd.push([""]);}
   rd.push(
-    ["","RETIRO","","","ACTIVACIÓN"],
+    ["","RETIRO (/mes)","","","ACTIVACIÓN (/mes)"],
     ["Combinaciones analizadas",R.length,"","Oportunidades activación",(AR||[]).length],
     ["Items a retirar",F.length,"","SKUs a activar",new Set((AR||[]).map(r=>r.item)).size],
     ["  CRÍTICO (<10)",crit.length,"","Locales destino",new Set((AR||[]).map(r=>r.targetLocal)).size],
     ["  MUY BAJO (10-20)",muyB.length],
     ["  BAJO (20-25)",F.length-crit.length-muyB.length],
     [""],
-    ["IMPACTO RETIRO","","","IMPACTO ACTIVACIÓN (neto)"],
-    ["Venta total actual",vt,"","Venta bruta potencial",arVB],
-    ["Venta perdida",vf,"","Canibalización (~"+Math.round(avgCn*100)+"%)",arVB-arVN],
-    ["% impacto venta",vf/(vt||1),"","VENTA NETA INCREMENTAL",arVN],
-    ["Rent. total actual",rt,"","Rent. bruta potencial",arRB],
-    ["Rent. perdida",rf,"","Canibalización rent.",arRB-arRN],
-    ["% impacto rent.",rf/(rt||1),"","RENT. NETA INCREMENTAL",arRN],
+    ["IMPACTO RETIRO (promedio mensual)","","","IMPACTO ACTIVACIÓN (neto mensual)"],
+    ["Venta prom. mensual total",vt,"","Venta bruta potencial/mes",arVB],
+    ["Venta perdida/mes",vf,"","Canibalización (~"+Math.round(avgCn*100)+"%)",arVB-arVN],
+    ["% impacto venta",vf/(vt||1),"","VENTA NETA INCREMENTAL/MES",arVN],
+    ["Rent. prom. mensual total",rt,"","Rent. bruta potencial/mes",arRB],
+    ["Rent. perdida/mes",rf,"","Canibalización rent.",arRB-arRN],
+    ["% impacto rent.",rf/(rt||1),"","RENT. NETA INCREMENTAL/MES",arRN],
     [""],["Import. con bajo rend.",I.length,"","Marcas a retirar/descodificar",B.length],
     [""],
-    ["BALANCE NETO"],
-    ["Venta: ganancia act. - pérdida retiro","",arVN-vf],
-    ["Rent.: ganancia act. - pérdida retiro","",arRN-rf]
+    ["BALANCE NETO (mensual)"],
+    ["Venta: ganancia act. - pérdida retiro /mes","",arVN-vf],
+    ["Rent.: ganancia act. - pérdida retiro /mes","",arRN-rf]
   );
   // By SC
   // Saturation / Density section
@@ -422,18 +449,18 @@ function _buildExcel(a,fd){
     const _avgD=_densities.length?_densities.reduce((s,d)=>s+d,0)/_densities.length:0;
     rd.push([""],["SATURACIÓN / DENSIDAD"],["Nivel de saturación",_satC.label],["Mod. activación",_satC.actMod],["Mod. retiro",_satC.retMod],["Locales con tramos",_trLocs.length],["Densidad promedio (items/tramo)",_avgD]);
   }
-  rd.push([""],["POR SUB CLASIFICACIÓN"],["Sub Clasif.","Retiro","Vta Ret.","Rent Ret.","","Act.","Vta Neta Act.","Rent Neta Act."]);
-  const bySCR={};R.forEach(r=>{if(!bySCR[r.subClasif])bySCR[r.subClasif]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[r.subClasif].fl++;bySCR[r.subClasif].vfl+=r.totalVenta;bySCR[r.subClasif].rfl+=r.totalRent;}});
+  rd.push([""],["POR SUB CLASIFICACIÓN (promedios mensuales)"],["Sub Clasif.","Retiro","Vta Ret./m","Rent Ret./m","","Act.","Vta Neta Act./m","Rent Neta Act./m"]);
+  const bySCR={};R.forEach(r=>{if(!bySCR[r.subClasif])bySCR[r.subClasif]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[r.subClasif].fl++;bySCR[r.subClasif].vfl+=r.vtaPromMes;bySCR[r.subClasif].rfl+=r.rentPromMes;}});
   const bySCA={};(AR||[]).forEach(r=>{if(!bySCA[r.subClasif])bySCA[r.subClasif]={n:0,vNt:0,rNt:0};bySCA[r.subClasif].n++;bySCA[r.subClasif].vNt+=(r.netVta||0);bySCA[r.subClasif].rNt+=(r.netRent||0);});
   [...new Set([...Object.keys(bySCR),...Object.keys(bySCA)])].sort().forEach(k=>{const r=bySCR[k]||{fl:0,vfl:0,rfl:0};const ac=bySCA[k]||{n:0,vNt:0,rNt:0};rd.push([k,r.fl,r.vfl,r.rfl,"",ac.n,ac.vNt,ac.rNt]);});
   // By Marca
-  rd.push([""],["POR MARCA (top 30)"],["Marca","Retiro","Vta Ret.","Rent Ret.","","Act.","Vta Neta Act.","Rent Neta Act."]);
-  const byMR={};R.filter(r=>!r.esImportado&&r.flagged).forEach(r=>{if(!byMR[r.marca])byMR[r.marca]={fl:0,vfl:0,rfl:0};byMR[r.marca].fl++;byMR[r.marca].vfl+=r.totalVenta;byMR[r.marca].rfl+=r.totalRent;});
+  rd.push([""],["POR MARCA (top 30, promedios mensuales)"],["Marca","Retiro","Vta Ret./m","Rent Ret./m","","Act.","Vta Neta Act./m","Rent Neta Act./m"]);
+  const byMR={};R.filter(r=>!r.esImportado&&r.flagged).forEach(r=>{if(!byMR[r.marca])byMR[r.marca]={fl:0,vfl:0,rfl:0};byMR[r.marca].fl++;byMR[r.marca].vfl+=r.vtaPromMes;byMR[r.marca].rfl+=r.rentPromMes;});
   const byMA={};(AR||[]).forEach(r=>{if(!byMA[r.marca])byMA[r.marca]={n:0,vNt:0,rNt:0};byMA[r.marca].n++;byMA[r.marca].vNt+=(r.netVta||0);byMA[r.marca].rNt+=(r.netRent||0);});
   [...new Set([...Object.keys(byMR),...Object.keys(byMA)])].sort((a,b)=>(byMR[b]||{fl:0}).fl-(byMR[a]||{fl:0}).fl).slice(0,30).forEach(k=>{const r=byMR[k]||{fl:0,vfl:0,rfl:0};const ac=byMA[k]||{n:0,vNt:0,rNt:0};if(r.fl||ac.n)rd.push([k,r.fl,r.vfl,r.rfl,"",ac.n,ac.vNt,ac.rNt]);});
   // By Proveedor
-  rd.push([""],["POR PROVEEDOR (top 30)"],["Proveedor","Retiro","Vta Ret.","Rent Ret.","","Act.","Vta Neta Act.","Rent Neta Act."]);
-  const byPR={};R.filter(r=>!r.esImportado&&r.flagged).forEach(r=>{if(!byPR[r.proveedor])byPR[r.proveedor]={fl:0,vfl:0,rfl:0};byPR[r.proveedor].fl++;byPR[r.proveedor].vfl+=r.totalVenta;byPR[r.proveedor].rfl+=r.totalRent;});
+  rd.push([""],["POR PROVEEDOR (top 30, promedios mensuales)"],["Proveedor","Retiro","Vta Ret./m","Rent Ret./m","","Act.","Vta Neta Act./m","Rent Neta Act./m"]);
+  const byPR={};R.filter(r=>!r.esImportado&&r.flagged).forEach(r=>{if(!byPR[r.proveedor])byPR[r.proveedor]={fl:0,vfl:0,rfl:0};byPR[r.proveedor].fl++;byPR[r.proveedor].vfl+=r.vtaPromMes;byPR[r.proveedor].rfl+=r.rentPromMes;});
   const byPA={};(AR||[]).forEach(r=>{if(!byPA[r.proveedor])byPA[r.proveedor]={n:0,vNt:0,rNt:0};byPA[r.proveedor].n++;byPA[r.proveedor].vNt+=(r.netVta||0);byPA[r.proveedor].rNt+=(r.netRent||0);});
   [...new Set([...Object.keys(byPR),...Object.keys(byPA)])].sort((a,b)=>(byPR[b]||{fl:0}).fl-(byPR[a]||{fl:0}).fl).slice(0,30).forEach(k=>{const r=byPR[k]||{fl:0,vfl:0,rfl:0};const ac=byPA[k]||{n:0,vNt:0,rNt:0};if(r.fl||ac.n)rd.push([k,r.fl,r.vfl,r.rfl,"",ac.n,ac.vNt,ac.rNt]);});
   const ws1=XLSX.utils.aoa_to_sheet(rd);ws1["!cols"]=[{wch:38},{wch:16},{wch:16},{wch:16},{wch:3},{wch:14},{wch:16},{wch:16}];
@@ -442,11 +469,11 @@ function _buildExcel(a,fd){
 
   // ══ 2. Items Retirar ══
   const _mc=a.isMultiClasif;
-  const hR=_mc?["Severidad","Local","Clasificación","Sub Clasif.","Item","Tamaño","Marca","Proveedor","Clase","Score","Venta $","Uds","Rent $","Margen %","%il Vta","%il Uds","%il Rent","%il Mrg","Razones","Grupo(n)"]:["Severidad","Local","Sub Clasif.","Item","Tamaño","Marca","Proveedor","Clase","Score","Venta $","Uds","Rent $","Margen %","%il Vta","%il Uds","%il Rent","%il Mrg","Razones","Grupo(n)"];
-  const dR=F.map(i=>{const row=[i.severity==="CRITICO"?"CRÍTICO":i.severity==="MUY_BAJO"?"MUY BAJO":"BAJO",i.local];if(_mc)row.push(i.clasificacion||"");row.push(i.subClasif,i.item,i.tamano,i.marca,i.proveedor,i.claseMerc,+i.compositeScore.toFixed(1),+i.totalVenta.toFixed(2),Math.round(i.totalCant),+i.totalRent.toFixed(2),i.avgMargen,+i.pSales.toFixed(1),+i.pUnits.toFixed(1),+i.pRent.toFixed(1),+i.pMargin.toFixed(1),i.reasons.join("; "),i.groupSize);return row;});
-  const ws2=XLSX.utils.aoa_to_sheet([hR,...dR]);ws2["!cols"]=[{wch:12},{wch:34},{wch:16},{wch:46},{wch:10},{wch:16},{wch:26},{wch:20},{wch:7},{wch:11},{wch:7},{wch:12},{wch:8},{wch:8},{wch:8},{wch:8},{wch:8},{wch:30},{wch:6}];
+  const hR=_mc?["Severidad","Local","Clasificación","Sub Clasif.","Item","Tamaño","Marca","Proveedor","Clase","Score","Meses","Vta/Mes","Uds/Mes","Rent/Mes","Venta $","Uds","Rent $","Margen %","%il Vta","%il Uds","%il Rent","%il Mrg","Razones","Grupo(n)"]:["Severidad","Local","Sub Clasif.","Item","Tamaño","Marca","Proveedor","Clase","Score","Meses","Vta/Mes","Uds/Mes","Rent/Mes","Venta $","Uds","Rent $","Margen %","%il Vta","%il Uds","%il Rent","%il Mrg","Razones","Grupo(n)"];
+  const dR=F.map(i=>{const row=[i.severity==="CRITICO"?"CRÍTICO":i.severity==="MUY_BAJO"?"MUY BAJO":"BAJO",i.local];if(_mc)row.push(i.clasificacion||"");row.push(i.subClasif,i.item,i.tamano,i.marca,i.proveedor,i.claseMerc,+i.compositeScore.toFixed(1),i.mesesActivos,+i.vtaPromMes.toFixed(2),Math.round(i.cantPromMes),+i.rentPromMes.toFixed(2),+i.totalVenta.toFixed(2),Math.round(i.totalCant),+i.totalRent.toFixed(2),i.avgMargen,+i.pSales.toFixed(1),+i.pUnits.toFixed(1),+i.pRent.toFixed(1),+i.pMargin.toFixed(1),i.reasons.join("; "),i.groupSize);return row;});
+  const ws2=XLSX.utils.aoa_to_sheet([hR,...dR]);ws2["!cols"]=[{wch:12},{wch:34},{wch:16},{wch:46},{wch:10},{wch:16},{wch:26},{wch:20},{wch:7},{wch:5},{wch:11},{wch:8},{wch:12},{wch:11},{wch:7},{wch:12},{wch:8},{wch:8},{wch:8},{wch:8},{wch:8},{wch:30},{wch:6}];
   ws2["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:dR.length,c:hR.length-1}})};
-  zCols(ws2,{8:ZS,9:ZD,10:ZI,11:ZD,12:ZP,13:ZS,14:ZS,15:ZS,16:ZS},1,dR.length);
+  zCols(ws2,{8:ZS,9:ZI,10:ZD,11:ZI,12:ZD,13:ZD,14:ZI,15:ZD,16:ZP,17:ZS,18:ZS,19:ZS,20:ZS},1,dR.length);
   XLSX.utils.book_append_sheet(wb,ws2,"Items a Retirar");
 
   // ══ 3. Importados ══
@@ -494,7 +521,8 @@ function _buildExcel(a,fd){
   XLSX.utils.book_append_sheet(wb,ws5,"Sim. Retiro");
 
   // ══ 6. Activar Productos ══
-  const _hABase=["Local Destino"];if(_mc)_hABase.push("Clasificación");_hABase.push("Item","Sub Clasif.","Marca","Tamaño","Proveedor","Loc. Sim.","Rent Bruta","Vta Bruta","Canib.%","Rent Neta","Vta Neta","Uds Neta","Mg%","Score","Fuerza","Razón","Loc. Ref.");
+  const _hasTramos=!!a._tramosData;
+  const _hABase=["Local Destino"];if(_mc)_hABase.push("Clasificación");_hABase.push("Item","Sub Clasif.","Marca","Tamaño","Proveedor","Loc. Sim.","Rent Bruta/Mes","Vta Bruta/Mes","Canib.%","Rent Neta/Mes","Vta Neta/Mes","Uds Neta/Mes","Mg%","Score","Fuerza","Razón","Loc. Ref.");
   const hA=_hABase.concat(_hasTramos?["Tramos","Items/Tramo","Ajuste Sat."]:[]);
   const dA=(AR||[]).map(r=>{const row=[r.targetLocal];if(_mc)row.push(r.clasificacion||"");row.push(r.item,r.subClasif,r.marca,r.tamano,r.proveedor,r.storesCarrying,+r.avgRent.toFixed(2),+r.avgVta.toFixed(2),(r.cannibRate||0),+(r.netRent||0).toFixed(2),+(r.netVta||0).toFixed(2),Math.round(r.netCant||0),r.avgMrg,+r.avgScore.toFixed(1),+r.strength.toFixed(1),r.reason,r.topStores.join(", "));if(_hasTramos){row.push(r.tramos||"",r.density!=null?+r.density.toFixed(1):"",r.tramosMod!=null?+r.tramosMod.toFixed(2):"");}return row;});
   const ws6=XLSX.utils.aoa_to_sheet([hA,...dA]);ws6["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:dA.length,c:hA.length-1}})};
@@ -531,13 +559,12 @@ function _buildExcel(a,fd){
   // ══ 8. Resumen Locales ══
   const byL={};R.forEach(r=>{if(!byL[r.local])byL[r.local]=[];byL[r.local].push(r);});
   const byLA={};(AR||[]).forEach(r=>{var l=r.targetLocal;if(!byLA[l])byLA[l]={n:0,vB:0,rB:0,vN:0,rN:0};byLA[l].n++;byLA[l].vB+=r.avgVta;byLA[l].rB+=r.avgRent;byLA[l].vN+=(r.netVta||0);byLA[l].rN+=(r.netRent||0);});
-  const _hasTramos=!!a._tramosData;
-  const lH=["Local","Total Items","Retirar","% Retiro","Import.","Vta Retirada","Rent Retirada","Vta Total","Rent Total","% Imp. Vta","% Imp. Rent","Activaciones","Vta Neta Act.","Rent Neta Act.","Balance Vta","Balance Rent"].concat(_hasTramos?["Tramos","Items/Tramo"]:[]);
+  const lH=["Local","Total Items","Retirar","% Retiro","Import.","Vta Ret./Mes","Rent Ret./Mes","Vta Total/Mes","Rent Total/Mes","% Imp. Vta","% Imp. Rent","Activaciones","Vta Neta Act./Mes","Rent Neta Act./Mes","Balance Vta/Mes","Balance Rent/Mes"].concat(_hasTramos?["Tramos","Items/Tramo"]:[]);
   const allLK=[...new Set([...Object.keys(byL),...Object.keys(byLA)])];
   const lD=allLK.map(function(l){
     var its=byL[l]||[];var fl=its.filter(function(i){return i.flagged;});
-    var vfl=fl.reduce(function(s,i){return s+i.totalVenta;},0),vtl=its.reduce(function(s,i){return s+i.totalVenta;},0);
-    var rfl=fl.reduce(function(s,i){return s+i.totalRent;},0),rtl=its.reduce(function(s,i){return s+i.totalRent;},0);
+    var vfl=fl.reduce(function(s,i){return s+i.vtaPromMes;},0),vtl=its.reduce(function(s,i){return s+i.vtaPromMes;},0);
+    var rfl=fl.reduce(function(s,i){return s+i.rentPromMes;},0),rtl=its.reduce(function(s,i){return s+i.rentPromMes;},0);
     var ac=byLA[l]||{n:0,vN:0,rN:0};
     var row=[l,its.length,fl.length,fl.length/(its.length||1),its.filter(function(i){return i.impFlagged;}).length,vfl,rfl,vtl,rtl,vfl/(vtl||1),rfl/(rtl||1),ac.n,ac.vN,ac.rN,ac.vN-vfl,ac.rN-rfl];
     if(_hasTramos){var _tr=a._tramosData[l];row.push(_tr||"",_tr?its.length/_tr:"");}
@@ -709,10 +736,10 @@ function _buildPPTXNative(a,fd){
   var CL=a.clasificacion||"";
   var F=fd.items,I=fd.imp,B=fd.brands,AR=fd.recos;
   var R=fd.base;
-  var vt=R.reduce(function(s,r){return s+r.totalVenta;},0);
-  var vf=F.reduce(function(s,r){return s+r.totalVenta;},0);
-  var rt=R.reduce(function(s,r){return s+r.totalRent;},0);
-  var rf=F.reduce(function(s,r){return s+r.totalRent;},0);
+  var vt=R.reduce(function(s,r){return s+r.vtaPromMes;},0);
+  var vf=F.reduce(function(s,r){return s+r.vtaPromMes;},0);
+  var rt=R.reduce(function(s,r){return s+r.rentPromMes;},0);
+  var rf=F.reduce(function(s,r){return s+r.rentPromMes;},0);
   var arVB=(AR||[]).reduce(function(s,r){return s+r.avgVta;},0);
   var arRB=(AR||[]).reduce(function(s,r){return s+r.avgRent;},0);
   var arVN=(AR||[]).reduce(function(s,r){return s+(r.netVta||0);},0);
@@ -737,22 +764,22 @@ function _buildPPTXNative(a,fd){
   var skuActivar=new Set((AR||[]).map(function(r){return r.item;})).size;
   var locActivar=new Set((AR||[]).map(function(r){return r.targetLocal;})).size;
   slides.push(_mkSlide(BG,
-    _txBox(2,emu(0.5),emu(0.15),emu(9),emu(0.4),_para(_run("MÉTRICAS CLAVE",2400,TXT,true,'Trebuchet MS')))+
+    _txBox(2,emu(0.5),emu(0.15),emu(9),emu(0.4),_para(_run("MÉTRICAS CLAVE (Promedios Mensuales)",2400,TXT,true,'Trebuchet MS')))+
     _txBox(3,emu(0.5),emu(0.48),emu(9),emu(0.25),_para(_run(totalSKUs+" SKUs en clasificación · "+R.length.toLocaleString()+" combinaciones item-local · "+new Set(R.map(function(r){return r.local;})).size+" locales",1100,SUB,false)))+
     // Row 1: RETIRO
-    _txBox(4,emu(0.5),emu(0.78),emu(2),emu(0.2),_para(_run("RETIRO",900,RED,true)))+
+    _txBox(4,emu(0.5),emu(0.78),emu(2),emu(0.2),_para(_run("RETIRO (/mes)",900,RED,true)))+
     _kpiCard(10,emu(0.5),emu(1.0),emu(2.8),emu(1.05),skuRetiro+" SKUs","a retirar de "+totalSKUs+" · "+F.length+" items",RED)+
-    _kpiCard(20,emu(3.6),emu(1.0),emu(2.8),emu(1.05),"$"+fmt(vf),"Vta Perdida ("+fP(vf/vt)+")",ORG)+
-    _kpiCard(30,emu(6.7),emu(1.0),emu(2.8),emu(1.05),"$"+fmt(rf),"Rent Perdida ("+fP(rf/rt)+")",PRP)+
+    _kpiCard(20,emu(3.6),emu(1.0),emu(2.8),emu(1.05),"$"+fmt(vf),"Vta Perdida/mes ("+fP(vf/vt)+")",ORG)+
+    _kpiCard(30,emu(6.7),emu(1.0),emu(2.8),emu(1.05),"$"+fmt(rf),"Rent Perdida/mes ("+fP(rf/rt)+")",PRP)+
     // Row 2: ACTIVACIÓN
-    _txBox(5,emu(0.5),emu(2.15),emu(2),emu(0.2),_para(_run("ACTIVACIÓN",900,GRN,true)))+
+    _txBox(5,emu(0.5),emu(2.15),emu(2),emu(0.2),_para(_run("ACTIVACIÓN (/mes)",900,GRN,true)))+
     _kpiCard(40,emu(0.5),emu(2.37),emu(2.8),emu(1.05),skuActivar+" SKUs","a activar · "+(AR||[]).length+" oport. · "+locActivar+" locales",GRN)+
-    _kpiCard(50,emu(3.6),emu(2.37),emu(2.8),emu(1.05),"$"+fmt(arVN),"Vta Neta (canib. ~"+Math.round(avgCn*100)+"%)","2DD4BF")+
-    _kpiCard(60,emu(6.7),emu(2.37),emu(2.8),emu(1.05),"$"+fmt(arRN),"Rent Neta Incremental","C084FC")+
+    _kpiCard(50,emu(3.6),emu(2.37),emu(2.8),emu(1.05),"$"+fmt(arVN),"Vta Neta/mes (canib. ~"+Math.round(avgCn*100)+"%)","2DD4BF")+
+    _kpiCard(60,emu(6.7),emu(2.37),emu(2.8),emu(1.05),"$"+fmt(arRN),"Rent Neta/mes","C084FC")+
     // Row 3: BALANCE NETO
-    _txBox(6,emu(0.5),emu(3.52),emu(2),emu(0.2),_para(_run("BALANCE NETO (activación − retiro)",900,TXT,true)))+
-    _kpiCard(70,emu(0.5),emu(3.75),emu(4.3),emu(1.15),"$"+fmt(balV),"Balance Venta Neta · Act $"+fmt(arVN)+" − Ret $"+fmt(vf),balV>=0?GRN:RED)+
-    _kpiCard(80,emu(5.2),emu(3.75),emu(4.3),emu(1.15),"$"+fmt(balR),"Balance Rent. Neta · Act $"+fmt(arRN)+" − Ret $"+fmt(rf),balR>=0?GRN:RED)
+    _txBox(6,emu(0.5),emu(3.52),emu(2),emu(0.2),_para(_run("BALANCE NETO /mes (activación − retiro)",900,TXT,true)))+
+    _kpiCard(70,emu(0.5),emu(3.75),emu(4.3),emu(1.15),"$"+fmt(balV),"Balance Venta/mes · Act $"+fmt(arVN)+" − Ret $"+fmt(vf),balV>=0?GRN:RED)+
+    _kpiCard(80,emu(5.2),emu(3.75),emu(4.3),emu(1.15),"$"+fmt(balR),"Balance Rent./mes · Act $"+fmt(arRN)+" − Ret $"+fmt(rf),balR>=0?GRN:RED)
   ));
 
   // --- SLIDE 3: Simulación Retiro ---
@@ -792,7 +819,7 @@ function _buildPPTXNative(a,fd){
   var dimLbl=a.isMultiClasif?"Clasificación":"Sub Clasif.";
   var dimTitle=a.isMultiClasif?"POR CLASIFICACIÓN":"POR SUB CLASIFICACIÓN";
   var recoDimFld=dimFld==="clasificacion"?"clasificacion":"subClasif";
-  var bySCR={};R.forEach(function(r){var k=r[dimFld];if(!bySCR[k])bySCR[k]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[k].fl++;bySCR[k].vfl+=r.totalVenta;bySCR[k].rfl+=r.totalRent;}});
+  var bySCR={};R.forEach(function(r){var k=r[dimFld];if(!bySCR[k])bySCR[k]={fl:0,vfl:0,rfl:0};if(r.flagged){bySCR[k].fl++;bySCR[k].vfl+=r.vtaPromMes;bySCR[k].rfl+=r.rentPromMes;}});
   var bySCA={};(AR||[]).forEach(function(r){var k=r[recoDimFld];if(!bySCA[k])bySCA[k]={n:0,vNt:0,rNt:0};bySCA[k].n++;bySCA[k].vNt+=(r.netVta||0);bySCA[k].rNt+=(r.netRent||0);});
   var allSCK=[].concat(Object.keys(bySCR),Object.keys(bySCA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){var brA=((bySCA[a]||{rNt:0}).rNt-(bySCR[a]||{rfl:0}).rfl);var brB=((bySCA[b]||{rNt:0}).rNt-(bySCR[b]||{rfl:0}).rfl);return brB-brA;});
   var scHdr=[{text:dimLbl,clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
@@ -806,7 +833,7 @@ function _buildPPTXNative(a,fd){
   ));
 
   // --- SLIDE 6: Por Proveedor ---
-  var byPR={};R.filter(function(r){return r.flagged;}).forEach(function(r){if(!byPR[r.proveedor])byPR[r.proveedor]={fl:0,vfl:0,rfl:0};byPR[r.proveedor].fl++;byPR[r.proveedor].vfl+=r.totalVenta;byPR[r.proveedor].rfl+=r.totalRent;});
+  var byPR={};R.filter(function(r){return r.flagged;}).forEach(function(r){if(!byPR[r.proveedor])byPR[r.proveedor]={fl:0,vfl:0,rfl:0};byPR[r.proveedor].fl++;byPR[r.proveedor].vfl+=r.vtaPromMes;byPR[r.proveedor].rfl+=r.rentPromMes;});
   var byPA={};(AR||[]).forEach(function(r){if(!byPA[r.proveedor])byPA[r.proveedor]={n:0,vNt:0,rNt:0};byPA[r.proveedor].n++;byPA[r.proveedor].vNt+=(r.netVta||0);byPA[r.proveedor].rNt+=(r.netRent||0);});
   var allPK=[].concat(Object.keys(byPR),Object.keys(byPA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){var brA=((byPA[a]||{rNt:0}).rNt-(byPR[a]||{rfl:0}).rfl);var brB=((byPA[b]||{rNt:0}).rNt-(byPR[b]||{rfl:0}).rfl);return brB-brA;}).slice(0,12);
   var pHdr=[{text:"Proveedor",clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
@@ -819,7 +846,7 @@ function _buildPPTXNative(a,fd){
   ));
 
   // --- SLIDE 7: Por Marca ---
-  var byMR={};R.filter(function(r){return !r.esImportado&&r.flagged;}).forEach(function(r){if(!byMR[r.marca])byMR[r.marca]={fl:0,vfl:0,rfl:0};byMR[r.marca].fl++;byMR[r.marca].vfl+=r.totalVenta;byMR[r.marca].rfl+=r.totalRent;});
+  var byMR={};R.filter(function(r){return !r.esImportado&&r.flagged;}).forEach(function(r){if(!byMR[r.marca])byMR[r.marca]={fl:0,vfl:0,rfl:0};byMR[r.marca].fl++;byMR[r.marca].vfl+=r.vtaPromMes;byMR[r.marca].rfl+=r.rentPromMes;});
   var byMA={};(AR||[]).forEach(function(r){if(!byMA[r.marca])byMA[r.marca]={n:0,vNt:0,rNt:0};byMA[r.marca].n++;byMA[r.marca].vNt+=(r.netVta||0);byMA[r.marca].rNt+=(r.netRent||0);});
   var allMK=[].concat(Object.keys(byMR),Object.keys(byMA)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){var brA=((byMA[a]||{rNt:0}).rNt-(byMR[a]||{rfl:0}).rfl);var brB=((byMA[b]||{rNt:0}).rNt-(byMR[b]||{rfl:0}).rfl);return brB-brA;}).slice(0,12);
   var mHdr=[{text:"Marca",clr:TXT,bold:true,fill:BG2},{text:"Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Vta Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Rent Ret.",clr:RED,bold:true,fill:BG2,align:'ctr'},{text:"Act.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Vta Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Rent Nt.",clr:GRN,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Vta",clr:TXT,bold:true,fill:BG2,align:'ctr'},{text:"Bal.Rent",clr:TXT,bold:true,fill:BG2,align:'ctr'}];
@@ -845,10 +872,10 @@ function _buildPPTXNative(a,fd){
 
   // --- SLIDE 9: Next Steps ---
   var steps=[
-    {n:"1. Retirar alcances",clr:RED,desc:"Retirar "+skuRetiro+" SKUs ("+F.length+" items). Iniciar con "+crit.length+" críticos (score<10). Impacto: $"+fmt(vf)+" venta, $"+fmt(rf)+" rent."},
+    {n:"1. Retirar alcances",clr:RED,desc:"Retirar "+skuRetiro+" SKUs ("+F.length+" items). Iniciar con "+crit.length+" críticos (score<10). Impacto/mes: $"+fmt(vf)+" venta, $"+fmt(rf)+" rent."},
     {n:"2. Descodificar marcas",clr:ORG,desc:B.length+" marcas identificadas para retiro total o parcial."},
-    {n:"3. Activar productos",clr:GRN,desc:"Activar "+skuActivar+" SKUs en "+locActivar+" locales ("+(AR||[]).length+" oportunidades). Vta neta: $"+fmt(arVN)+", Rent neta: $"+fmt(arRN)+"."},
-    {n:"4. Balance neto esperado",clr:balR>=0?GRN:RED,desc:"Venta: $"+fmt(balV)+" | Rentabilidad: $"+fmt(balR)+" (activación − retiro)."},
+    {n:"3. Activar productos",clr:GRN,desc:"Activar "+skuActivar+" SKUs en "+locActivar+" locales ("+(AR||[]).length+" oportunidades). Vta neta/mes: $"+fmt(arVN)+", Rent neta/mes: $"+fmt(arRN)+"."},
+    {n:"4. Balance neto esperado /mes",clr:balR>=0?GRN:RED,desc:"Venta: $"+fmt(balV)+"/mes | Rentabilidad: $"+fmt(balR)+"/mes (activación − retiro)."},
     {n:"5. Monitorear resultados",clr:ACC,desc:"Revisión a 30-60 días post-ejecución vs expectativa."}
   ];
   var stepParas="";
@@ -916,25 +943,52 @@ function _buildPPTXNative(a,fd){
 })();
 
 // ═══ STATE ═══
-const S={step:"upload",ventasFile:null,alcancesFile:null,analysis:null,loading:false,error:"",
+const S={step:"upload",ventasFiles:[],alcancesFiles:[],analysis:null,loading:false,error:"",
   tab:"exec",selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),
   txtItem:"",onlyFlagged:true,
   nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,
   nfPanelOpen:false,sortBy:"compositeScore",sortDir:"asc",openDrop:null,dropSearch:"",page:0,PS:200,
   simLevel:"all",resDim:"subClasif",
   satLevel:"no_saturada",tramosFile:null,tramosPreview:null,prevStep:"upload",
-  execSort:"balR",execDir:"desc",
+  execSort:"balR",execDir:"desc",analysisName:"",
 };
 let allLocals=[],allClasifs=[],allSCs=[],allMarcas=[],allProvs=[];
 function ss(p){Object.assign(S,p);render();}
 function readF(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>{try{res(XLSX.read(new Uint8Array(e.target.result),{type:"array"}))}catch(e2){rej(e2)}};r.onerror=()=>rej(new Error("Error leyendo archivo"));r.readAsArrayBuffer(file);});}
 
 async function analyze(){
-  if(!S.ventasFile||!S.alcancesFile){ss({error:"Sube ambos archivos"});return;}
+  if(!S.ventasFiles.length||!S.alcancesFiles.length){ss({error:"Sube ambos archivos"});return;}
   ss({loading:true,error:""});
   try{
-    const[vw,aw]=await Promise.all([readF(S.ventasFile),readF(S.alcancesFile)]);
-    const vd=parseVentas(vw,S.ventasFile.name),ad=parseAlcances(aw),r=runAnalysis(vd,ad);
+    const vWbs=await Promise.all(S.ventasFiles.map(f=>readF(f)));
+    const aWbs=await Promise.all(S.alcancesFiles.map(f=>readF(f)));
+    // Combine ventas
+    let combItems=[],combLocs=new Set(),combSCs=new Set(),combClasifs=new Set(),fileLabels=[];
+    vWbs.forEach((wb,i)=>{
+      const vd=parseVentas(wb,S.ventasFiles[i].name);
+      fileLabels.push(vd.clasificacion);
+      // If file has no clasificación column, stamp items with filename-derived clasif
+      if(vd.clasificaciones.length===0&&vd.clasificacion){
+        const cl=vd.clasificacion.toUpperCase();
+        vd.items.forEach(it=>{it.clasificacion=cl;});
+        combClasifs.add(cl);
+      } else {
+        vd.clasificaciones.forEach(c=>combClasifs.add(c));
+      }
+      combItems=combItems.concat(vd.items);
+      vd.locals.forEach(l=>combLocs.add(l));
+      vd.subClasifs.forEach(s=>combSCs.add(s));
+    });
+    const clasificaciones=[...combClasifs].sort();
+    const isMultiClasif=clasificaciones.length>1;
+    const cLabel=S.ventasFiles.length>1&&S.analysisName.trim()?S.analysisName.trim():(fileLabels[0]||"");
+    const vd={items:combItems,locals:[...combLocs].sort(),subClasifs:[...combSCs].sort(),clasificacion:cLabel,clasificaciones,isMultiClasif};
+    // Combine alcances
+    const mergedAlc={},mergedDates={};
+    aWbs.forEach(wb=>{const ad=parseAlcances(wb);for(const[it,s]of Object.entries(ad.alcMap)){if(!mergedAlc[it])mergedAlc[it]=new Set();s.forEach(l=>mergedAlc[it].add(l));}
+      for(const[it,locals]of Object.entries(ad.alcDates||{})){if(!mergedDates[it])mergedDates[it]={};for(const[loc,dt]of Object.entries(locals)){if(!mergedDates[it][loc]||dt<mergedDates[it][loc])mergedDates[it][loc]=dt;}}});
+    const ad={alcMap:mergedAlc,alcDates:mergedDates};
+    const r=runAnalysis(vd,ad);
     r._alcMap=ad.alcMap;
     // Tramos: only for single-classification (multi-clasif tramos TBD)
     const tramosData=!vd.isMultiClasif?getTramosForClasif(vd.clasificacion):null;
@@ -1041,7 +1095,7 @@ window.doExportExcel=function(){
   if(typeof XLSX==="undefined"){alert("Error: La librería XLSX no se cargó. Recarga la página.");return;}
   try{_buildExcel(S.analysis,getFiltered());}catch(e){alert("Error: "+e.message);console.error(e);}
 };
-window.resetApp=function(){ss({step:"upload",analysis:null,ventasFile:null,alcancesFile:null,selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,satLevel:"no_saturada",tramosFile:null,tramosPreview:null});};
+window.resetApp=function(){ss({step:"upload",analysis:null,ventasFiles:[],alcancesFiles:[],analysisName:"",selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,satLevel:"no_saturada",tramosFile:null,tramosPreview:null});};
 window.setNF=function(f,v){const x=v===""?null:parseFloat(v);ss({[f]:isNaN(x)?null:x,page:0});};
 window.applyPreset=function(p){const pr={"conVenta":{nfVentaMin:0.01,nfVentaMax:null},"sinVenta":{nfVentaMin:null,nfVentaMax:0},"rentPos":{nfRentMin:0.01,nfRentMax:null},"rentNeg":{nfRentMin:null,nfRentMax:0},"sCrit":{nfScoreMin:null,nfScoreMax:10},"sMB":{nfScoreMin:null,nfScoreMax:20},"clear":{nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null}};if(pr[p])ss({...pr[p],page:0});};
 window.hasAnyNF=function(){return[S.nfVentaMin,S.nfVentaMax,S.nfCantMin,S.nfCantMax,S.nfRentMin,S.nfRentMax,S.nfMargenMin,S.nfMargenMax,S.nfScoreMin,S.nfScoreMax].some(v=>v!==null);};
@@ -1049,13 +1103,13 @@ window.hasAnyNF=function(){return[S.nfVentaMin,S.nfVentaMax,S.nfCantMin,S.nfCant
 // CSV exports (respect current filters)
 window.dlCSVRetiro=function(){
   const d=getFiltered();const CL=S.analysis.clasificacion||"";const _mc=S.analysis.isMultiClasif;
-  const h=_mc?["Severidad","Local","Clasificación","Sub Clasif","Item","Tamaño","Marca","Proveedor","Clase","Score","Venta","Uds","Rent","Margen%","%Vta","%Uds","%Rent","%Mrg","Razones","Grupo"]:["Severidad","Local","Sub Clasif","Item","Tamaño","Marca","Proveedor","Clase","Score","Venta","Uds","Rent","Margen%","%Vta","%Uds","%Rent","%Mrg","Razones","Grupo"];
-  const rows=[h,...d.items.map(i=>{const row=[i.severity||"BAJO",i.local];if(_mc)row.push(i.clasificacion||"");row.push(i.subClasif,i.item,i.tamano,i.marca,i.proveedor,i.claseMerc,i.compositeScore.toFixed(1),i.totalVenta.toFixed(2),Math.round(i.totalCant),i.totalRent.toFixed(2),(i.avgMargen*100).toFixed(1),i.pSales.toFixed(1),i.pUnits.toFixed(1),i.pRent.toFixed(1),i.pMargin.toFixed(1),i.reasons.join("; "),i.groupSize);return row;})];
+  const h=_mc?["Severidad","Local","Clasificación","Sub Clasif","Item","Tamaño","Marca","Proveedor","Clase","Score","Meses","Vta/Mes","Uds/Mes","Rent/Mes","Venta","Uds","Rent","Margen%","%Vta","%Uds","%Rent","%Mrg","Razones","Grupo"]:["Severidad","Local","Sub Clasif","Item","Tamaño","Marca","Proveedor","Clase","Score","Meses","Vta/Mes","Uds/Mes","Rent/Mes","Venta","Uds","Rent","Margen%","%Vta","%Uds","%Rent","%Mrg","Razones","Grupo"];
+  const rows=[h,...d.items.map(i=>{const row=[i.severity||"BAJO",i.local];if(_mc)row.push(i.clasificacion||"");row.push(i.subClasif,i.item,i.tamano,i.marca,i.proveedor,i.claseMerc,i.compositeScore.toFixed(1),i.mesesActivos,i.vtaPromMes.toFixed(2),Math.round(i.cantPromMes),i.rentPromMes.toFixed(2),i.totalVenta.toFixed(2),Math.round(i.totalCant),i.totalRent.toFixed(2),(i.avgMargen*100).toFixed(1),i.pSales.toFixed(1),i.pUnits.toFixed(1),i.pRent.toFixed(1),i.pMargin.toFixed(1),i.reasons.join("; "),i.groupSize);return row;})];
   dlCSV(rows,"Retiro_Alcances"+(CL?"_"+CL.replace(/\s+/g,"_"):"")+".csv");
 };
 window.dlCSVActivar=function(){
   const d=getFiltered();const CL=S.analysis.clasificacion||"";const _mc=S.analysis.isMultiClasif;
-  const h=_mc?["Local Destino","Clasificación","Item","Sub Clasif","Marca","Tamaño","Proveedor","Loc. Similares","Rent Bruta","Vta Bruta","Canib%","Rent Neta","Vta Neta","Uds Neta","Mg%","Score","Fuerza","Razón","Locales Ref"]:["Local Destino","Item","Sub Clasif","Marca","Tamaño","Proveedor","Loc. Similares","Rent Bruta","Vta Bruta","Canib%","Rent Neta","Vta Neta","Uds Neta","Mg%","Score","Fuerza","Razón","Locales Ref"];
+  const h=_mc?["Local Destino","Clasificación","Item","Sub Clasif","Marca","Tamaño","Proveedor","Loc. Similares","Rent Bruta/Mes","Vta Bruta/Mes","Canib%","Rent Neta/Mes","Vta Neta/Mes","Uds Neta/Mes","Mg%","Score","Fuerza","Razón","Locales Ref"]:["Local Destino","Item","Sub Clasif","Marca","Tamaño","Proveedor","Loc. Similares","Rent Bruta/Mes","Vta Bruta/Mes","Canib%","Rent Neta/Mes","Vta Neta/Mes","Uds Neta/Mes","Mg%","Score","Fuerza","Razón","Locales Ref"];
   const rows=[h,...d.recos.map(r=>{const row=[r.targetLocal];if(_mc)row.push(r.clasificacion||"");row.push(r.item,r.subClasif,r.marca,r.tamano,r.proveedor,r.storesCarrying,r.avgRent.toFixed(2),r.avgVta.toFixed(2),Math.round((r.cannibRate||0)*100),(r.netRent||0).toFixed(2),(r.netVta||0).toFixed(2),Math.round(r.netCant||0),(r.avgMrg*100).toFixed(1),r.avgScore.toFixed(1),r.strength.toFixed(1),r.reason,r.topStores.join("; "));return row;})];
   dlCSV(rows,"Activar_Productos"+(CL?"_"+CL.replace(/\s+/g,"_"):"")+".csv");
 };
@@ -1081,26 +1135,32 @@ function renderUpload(app){
   <div class="cnt fade" style="max-width:740px;padding-top:36px">
     <div style="text-align:center;margin-bottom:28px"><div style="font-size:26px;font-weight:800;letter-spacing:-.8px;margin-bottom:5px">Sube tus archivos</div><div style="font-size:12px;color:var(--tx3)">Ventas (tabla cruzada) + Alcances (Clase R). La clasificación se lee del nombre del archivo de ventas.</div></div>
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px">
-      <div class="upload-zone ${S.ventasFile?"ok":""}" id="dV" onclick="document.getElementById('fV').click()"><input type="file" id="fV" accept=".xlsx,.xls" style="display:none"><div style="font-size:28px">📊</div><div style="font-size:12px;font-weight:700;color:${S.ventasFile?"var(--green)":"var(--tx2)"}">Ventas</div><div style="font-size:10px;color:${S.ventasFile?"var(--green)":"var(--tx3)"};margin-top:3px">${S.ventasFile?esc(S.ventasFile.name):"4 métricas por local"}</div></div>
-      <div class="upload-zone ${S.alcancesFile?"ok":""}" id="dA" onclick="document.getElementById('fA').click()"><input type="file" id="fA" accept=".xlsx,.xls" style="display:none"><div style="font-size:28px">📋</div><div style="font-size:12px;font-weight:700;color:${S.alcancesFile?"var(--green)":"var(--tx2)"}">Alcances</div><div style="font-size:10px;color:${S.alcancesFile?"var(--green)":"var(--tx3)"};margin-top:3px">${S.alcancesFile?esc(S.alcancesFile.name):"1 = activo"}</div></div>
+      <div class="upload-zone ${S.ventasFiles.length?"ok":""}" id="dV" onclick="document.getElementById('fV').click()"><input type="file" id="fV" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📊</div><div style="font-size:12px;font-weight:700;color:${S.ventasFiles.length?"var(--green)":"var(--tx2)"}">Ventas ${S.ventasFiles.length>1?"("+S.ventasFiles.length+")":""}</div><div style="font-size:10px;color:${S.ventasFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.ventasFiles.length?S.ventasFiles.map(f=>esc(f.name)).join("<br>"):"4 métricas por local"}</div>${S.ventasFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({ventasFiles:[],analysisName:''})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
+      <div class="upload-zone ${S.alcancesFiles.length?"ok":""}" id="dA" onclick="document.getElementById('fA').click()"><input type="file" id="fA" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📋</div><div style="font-size:12px;font-weight:700;color:${S.alcancesFiles.length?"var(--green)":"var(--tx2)"}">Alcances ${S.alcancesFiles.length>1?"("+S.alcancesFiles.length+")":""}</div><div style="font-size:10px;color:${S.alcancesFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.alcancesFiles.length?S.alcancesFiles.map(f=>esc(f.name)).join("<br>"):"1 = activo"}</div>${S.alcancesFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({alcancesFiles:[]})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
     </div>
+    ${S.ventasFiles.length>1?`<div class="crd" style="margin-top:4px;padding:12px 14px">
+      <div style="font-size:9px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">NOMBRE DEL ANÁLISIS</div>
+      <input type="text" id="anlName" value="${esc(S.analysisName)}" placeholder="Ej: Abarrotes, Lácteos + Bebidas..." style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--bg4);background:var(--bg2);color:var(--tx);font-family:var(--font);font-size:12px;outline:none" onchange="ss({analysisName:this.value})">
+      <div style="font-size:9px;color:var(--tx4);margin-top:3px">${S.ventasFiles.length} archivos seleccionados</div>
+    </div>`:""}
     <div class="crd" style="margin-top:4px;padding:12px 14px">
       <div style="font-size:9px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Nivel de Saturación de Góndola</div>
       <div class="nf-presets">${Object.entries(SAT_LEVELS).map(([k,v])=>`<button class="nf-pre ${S.satLevel===k?"on":""}" onclick="ss({satLevel:'${k}'})" style="${S.satLevel===k?"border-color:"+v.color+";color:"+v.color:""}">${v.label}</button>`).join("")}</div>
       <div style="font-size:9px;color:var(--tx4);margin-top:2px">Mod. activación: ${SAT_LEVELS[S.satLevel].actMod.toFixed(2)}x · Mod. retiro: ${SAT_LEVELS[S.satLevel].retMod.toFixed(2)}x</div>
-      ${(()=>{const cl=S.ventasFile?extractClasifName(S.ventasFile.name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="margin-top:8px;display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
+      ${(()=>{const cl=S.ventasFiles.length?extractClasifName(S.ventasFiles[0].name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="margin-top:8px;display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
     </div>
     ${S.error?`<div style="color:var(--red);margin-bottom:10px;font-size:12px;text-align:center">${esc(S.error)}</div>`:""}
-    <div style="text-align:center"><button class="btn ${S.ventasFile&&S.alcancesFile?"btn-p":"btn-s"}" onclick="analyze()" ${S.loading||!S.ventasFile||!S.alcancesFile?"disabled":""}>${S.loading?'<span class="spin"></span> Procesando...':"Analizar Surtido"}</button></div>
+    <div style="text-align:center"><button class="btn ${S.ventasFiles.length&&S.alcancesFiles.length?"btn-p":"btn-s"}" onclick="analyze()" ${S.loading||!S.ventasFiles.length||!S.alcancesFiles.length?"disabled":""}>${S.loading?'<span class="spin"></span> Procesando...':"Analizar Surtido"}</button></div>
     <div class="crd" style="margin-top:24px"><div style="font-size:11px;font-weight:700;color:var(--green);margin-bottom:6px">METODOLOGÍA</div><div style="font-size:11px;color:var(--tx3);line-height:1.7">
       Cada item se compara <strong style="color:var(--yellow)">SOLO vs pares del mismo LOCAL + CLASIFICACIÓN + SUB CLASIFICACIÓN</strong>. Clasificaciones y sub clasificaciones se leen del archivo.<br>
       <strong style="color:var(--tx2)">Score</strong> = <span class="mono">0.40×%Rent + 0.25×%Vta + 0.20×%Uds + 0.15×%Mrg</span>. Corte: &lt;25.<br>
+      <strong style="color:var(--tx2)">Promedios mensuales:</strong> Si el archivo de alcances incluye columna FEC_INICIO, se calculan meses activos y promedios mensuales. Items con &lt;4 meses se excluyen.<br>
       <strong style="color:var(--tx2)">Multi-clasificación:</strong> Se puede subir un archivo con varias clasificaciones. La similitud entre locales y activaciones se calculan con todo el archivo junto.
     </div></div>
   </div>`;
-  document.getElementById("fV").addEventListener("change",e=>{if(e.target.files[0])ss({ventasFile:e.target.files[0],error:""});});
-  document.getElementById("fA").addEventListener("change",e=>{if(e.target.files[0])ss({alcancesFile:e.target.files[0],error:""});});
-  ["dV","dA"].forEach((id,i)=>{const el=document.getElementById(id);el.addEventListener("dragover",e=>{e.preventDefault();el.style.borderColor="var(--blue)";});el.addEventListener("dragleave",()=>el.style.borderColor="");el.addEventListener("drop",e=>{e.preventDefault();el.style.borderColor="";const f=e.dataTransfer.files[0];if(f)ss(i===0?{ventasFile:f,error:""}:{alcancesFile:f,error:""});});});
+  document.getElementById("fV").addEventListener("change",e=>{if(e.target.files.length)ss({ventasFiles:[...S.ventasFiles,...e.target.files],error:""});});
+  document.getElementById("fA").addEventListener("change",e=>{if(e.target.files.length)ss({alcancesFiles:[...S.alcancesFiles,...e.target.files],error:""});});
+  ["dV","dA"].forEach((id,i)=>{const el=document.getElementById(id);el.addEventListener("dragover",e=>{e.preventDefault();el.style.borderColor="var(--blue)";});el.addEventListener("dragleave",()=>el.style.borderColor="");el.addEventListener("drop",e=>{e.preventDefault();el.style.borderColor="";const fs=[...e.dataTransfer.files].filter(f=>/\.xlsx?$/i.test(f.name));if(fs.length)ss(i===0?{ventasFiles:[...S.ventasFiles,...fs],error:""}:{alcancesFiles:[...S.alcancesFiles,...fs],error:""});});});
 }
 
 // ═══ TRAMOS CONFIG SCREEN ═══
@@ -1212,8 +1272,8 @@ function renderResults(app){
 
   // ── EXEC ──
   if(S.tab==="exec"){
-    const F=base.filter(i=>i.flagged),vt=base.reduce((s,r)=>s+r.totalVenta,0),vf=F.reduce((s,r)=>s+r.totalVenta,0),rt=base.reduce((s,r)=>s+r.totalRent,0),rf=F.reduce((s,r)=>s+r.totalRent,0);
-    const vtAll=a.results.reduce((s,r)=>s+r.totalVenta,0),rtAll=a.results.reduce((s,r)=>s+r.totalRent,0);
+    const F=base.filter(i=>i.flagged),vt=base.reduce((s,r)=>s+r.vtaPromMes,0),vf=F.reduce((s,r)=>s+r.vtaPromMes,0),rt=base.reduce((s,r)=>s+r.rentPromMes,0),rf=F.reduce((s,r)=>s+r.rentPromMes,0);
+    const vtAll=a.results.reduce((s,r)=>s+r.vtaPromMes,0),rtAll=a.results.reduce((s,r)=>s+r.rentPromMes,0);
     const crit=F.filter(x=>x.severity==="CRITICO"),muyB=F.filter(x=>x.severity==="MUY_BAJO");
     const AR=recos;
     const arVBruta=AR.reduce((s,r)=>s+r.avgVta,0),arRBruta=AR.reduce((s,r)=>s+r.avgRent,0);
@@ -1230,7 +1290,7 @@ function renderResults(app){
 
     // Group base by dimension
     const byDimR={};
-    base.forEach(r=>{const k=r[dimField];if(!byDimR[k])byDimR[k]={t:0,fl:0,vfl:0,rfl:0,vtot:0,rtot:0,imp:0};const o=byDimR[k];o.t++;o.vtot+=r.totalVenta;o.rtot+=r.totalRent;if(r.flagged){o.fl++;o.vfl+=r.totalVenta;o.rfl+=r.totalRent;}if(r.impFlagged)o.imp++;});
+    base.forEach(r=>{const k=r[dimField];if(!byDimR[k])byDimR[k]={t:0,fl:0,vfl:0,rfl:0,vtot:0,rtot:0,imp:0};const o=byDimR[k];o.t++;o.vtot+=r.vtaPromMes;o.rtot+=r.rentPromMes;if(r.flagged){o.fl++;o.vfl+=r.vtaPromMes;o.rfl+=r.rentPromMes;}if(r.impFlagged)o.imp++;});
     // Group recos by dimension
     const byDimA={};
     AR.forEach(r=>{const k=r[recoDimField];if(!byDimA[k])byDimA[k]={n:0,vNt:0,rNt:0};const o=byDimA[k];o.n++;o.vNt+=(r.netVta||0);o.rNt+=(r.netRent||0);});
@@ -1247,13 +1307,13 @@ function renderResults(app){
     <div class="exec">
       <div class="exec-card" style="border-top:3px solid var(--tx)"><h4>Analizados</h4><div class="exec-big">${base.length.toLocaleString()}</div><div class="exec-sub">${uI} SKUs · ${new Set(base.map(r=>r.local)).size} locales${a.isMultiClasif?" · "+a.clasificaciones.length+" clasif.":""} · ${new Set(base.map(r=>r.subClasif)).size} sub clasif.</div></div>
       <div class="exec-card" style="border-top:3px solid var(--red)"><h4>Retiro Alcances</h4><div class="exec-big" style="color:var(--red)">${F.length.toLocaleString()}</div><div class="exec-sub">${crit.length} crít. · ${muyB.length} m.bajo · ${F.length-crit.length-muyB.length} bajo</div></div>
-      <div class="exec-card" style="border-top:3px solid var(--orange)"><h4>Venta Perdida</h4><div class="exec-big" style="color:var(--orange)">$${fmt(vf)}</div><div class="exec-sub">${fP(vf/vtAll)} de $${fmt(vtAll)}</div></div>
-      <div class="exec-card" style="border-top:3px solid var(--purple)"><h4>Rent. Perdida</h4><div class="exec-big" style="color:var(--purple)">$${fmt(rf)}</div><div class="exec-sub">${fP(rf/rtAll)} de $${fmt(rtAll)}</div></div>
+      <div class="exec-card" style="border-top:3px solid var(--orange)"><h4>Venta Perdida /mes</h4><div class="exec-big" style="color:var(--orange)">$${fmt(vf)}</div><div class="exec-sub">${fP(vf/vtAll)} de $${fmt(vtAll)}/mes</div></div>
+      <div class="exec-card" style="border-top:3px solid var(--purple)"><h4>Rent. Perdida /mes</h4><div class="exec-big" style="color:var(--purple)">$${fmt(rf)}</div><div class="exec-sub">${fP(rf/rtAll)} de $${fmt(rtAll)}/mes</div></div>
       <div class="exec-card" style="border-top:3px solid var(--green)"><h4>Activación</h4><div class="exec-big" style="color:var(--green)">${AR.length.toLocaleString()}</div><div class="exec-sub">${new Set(AR.map(r=>r.item)).size} SKUs · ${new Set(AR.map(r=>r.targetLocal)).size} locales</div></div>
-      <div class="exec-card" style="border-top:3px solid #2dd4bf"><h4>Vta Neta Activ.</h4><div class="exec-big" style="color:#2dd4bf">$${fmt(arVNeta)}</div><div class="exec-sub">Bruta $${fmt(arVBruta)} · Canib. ~${(avgCannib*100).toFixed(0)}%</div></div>
-      <div class="exec-card" style="border-top:3px solid #c084fc"><h4>Rent Neta Activ.</h4><div class="exec-big" style="color:#c084fc">$${fmt(arRNeta)}</div><div class="exec-sub">Bruta $${fmt(arRBruta)}</div></div>
-      <div class="exec-card" style="border-top:3px solid ${balV>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Vta.</h4><div class="exec-big" style="color:${balV>=0?"var(--green)":"var(--red)"}">$${fmt(balV)}</div><div class="exec-sub">Act. $${fmt(arVNeta)} − Ret. $${fmt(vf)}</div></div>
-      <div class="exec-card" style="border-top:3px solid ${balR>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Rent.</h4><div class="exec-big" style="color:${balR>=0?"var(--green)":"var(--red)"}">$${fmt(balR)}</div><div class="exec-sub">Act. $${fmt(arRNeta)} − Ret. $${fmt(rf)}</div></div>
+      <div class="exec-card" style="border-top:3px solid #2dd4bf"><h4>Vta Neta Act. /mes</h4><div class="exec-big" style="color:#2dd4bf">$${fmt(arVNeta)}</div><div class="exec-sub">Bruta $${fmt(arVBruta)} · Canib. ~${(avgCannib*100).toFixed(0)}%</div></div>
+      <div class="exec-card" style="border-top:3px solid #c084fc"><h4>Rent Neta Act. /mes</h4><div class="exec-big" style="color:#c084fc">$${fmt(arRNeta)}</div><div class="exec-sub">Bruta $${fmt(arRBruta)}</div></div>
+      <div class="exec-card" style="border-top:3px solid ${balV>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Vta. /mes</h4><div class="exec-big" style="color:${balV>=0?"var(--green)":"var(--red)"}">$${fmt(balV)}</div><div class="exec-sub">Act. $${fmt(arVNeta)} − Ret. $${fmt(vf)}</div></div>
+      <div class="exec-card" style="border-top:3px solid ${balR>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Rent. /mes</h4><div class="exec-big" style="color:${balR>=0?"var(--green)":"var(--red)"}">$${fmt(balR)}</div><div class="exec-sub">Act. $${fmt(arRNeta)} − Ret. $${fmt(rf)}</div></div>
       ${(()=>{const td=a._tramosData;if(!td)return"";const satC=SAT_LEVELS[a._satLevel||"no_saturada"];const locs=Object.keys(td);const densities=locs.map(l=>{const tr=td[l];const items=base.filter(r=>r.local===l).length;return items/tr;}).filter(d=>d>0);const avgD=densities.length?densities.reduce((s,d)=>s+d,0)/densities.length:0;return`<div class="exec-card" style="border-top:3px solid var(--blue)"><h4>Densidad Items/Tramo</h4><div class="exec-big" style="color:var(--blue)">${avgD.toFixed(1)}</div><div class="exec-sub">${satC.label} · ${locs.length} locales c/tramos</div></div>`;})()}
     </div>
 
@@ -1265,19 +1325,19 @@ function renderResults(app){
       <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
         <div class="stat"><div class="stat-v">${tblData.length}</div><div class="stat-l">${dimLabel}s</div></div>
         <div class="stat"><div class="stat-v" style="color:var(--red)">${tRet.toLocaleString()}</div><div class="stat-l">Retiros</div></div>
-        <div class="stat"><div class="stat-v" style="color:var(--orange)">$${fmt(tVR)}</div><div class="stat-l">Vta Retirada</div></div>
-        <div class="stat"><div class="stat-v" style="color:var(--purple)">$${fmt(tRR)}</div><div class="stat-l">Rent Retirada</div></div>
+        <div class="stat"><div class="stat-v" style="color:var(--orange)">$${fmt(tVR)}</div><div class="stat-l">Vta Ret./mes</div></div>
+        <div class="stat"><div class="stat-v" style="color:var(--purple)">$${fmt(tRR)}</div><div class="stat-l">Rent Ret./mes</div></div>
         <div class="stat"><div class="stat-v" style="color:var(--green)">${tAct.toLocaleString()}</div><div class="stat-l">Activaciones</div></div>
-        <div class="stat"><div class="stat-v" style="color:#2dd4bf">$${fmt(tVA)}</div><div class="stat-l">Vta Nt. Act.</div></div>
-        <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tRA)}</div><div class="stat-l">Rent Nt. Act.</div></div>
-        <div class="stat"><div class="stat-v" style="color:${(tRA-tRR)>=0?"var(--green)":"var(--red)"}">$${fmt(tRA-tRR)}</div><div class="stat-l">Bal. Rent</div></div>
+        <div class="stat"><div class="stat-v" style="color:#2dd4bf">$${fmt(tVA)}</div><div class="stat-l">Vta Nt./mes</div></div>
+        <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tRA)}</div><div class="stat-l">Rent Nt./mes</div></div>
+        <div class="stat"><div class="stat-v" style="color:${(tRA-tRR)>=0?"var(--green)":"var(--red)"}">$${fmt(tRA-tRR)}</div><div class="stat-l">Bal.Rent/mes</div></div>
       </div>
       <div class="scx"><table><thead><tr>
         <th class="${eC("key")}" onclick="hExecSort('key')">${dimLabel}${eI("key")}</th><th class="${eC("total")}" onclick="hExecSort('total')">Total${eI("total")}</th>
         <th class="${eC("ret")}" style="color:var(--red)" onclick="hExecSort('ret')">Ret.${eI("ret")}</th><th class="${eC("pRet")}" onclick="hExecSort('pRet')">% Ret.${eI("pRet")}</th><th class="${eC("imp")}" style="color:var(--blue)" onclick="hExecSort('imp')">Imp.${eI("imp")}</th>
-        <th class="${eC("vRet")}" style="color:var(--orange)" onclick="hExecSort('vRet')">Vta Ret.${eI("vRet")}</th><th class="${eC("rRet")}" style="color:var(--purple)" onclick="hExecSort('rRet')">Rent Ret.${eI("rRet")}</th>
-        <th class="${eC("act")}" style="color:var(--green)" onclick="hExecSort('act')">Act.${eI("act")}</th><th class="${eC("vAct")}" style="color:#2dd4bf" onclick="hExecSort('vAct')">Vta Nt. Act.${eI("vAct")}</th><th class="${eC("rAct")}" style="color:#c084fc" onclick="hExecSort('rAct')">Rent Nt. Act.${eI("rAct")}</th>
-        <th class="${eC("balV")}" onclick="hExecSort('balV')">Bal. Vta${eI("balV")}</th><th class="${eC("balR")}" onclick="hExecSort('balR')">Bal. Rent${eI("balR")}</th>
+        <th class="${eC("vRet")}" style="color:var(--orange)" onclick="hExecSort('vRet')">Vta Ret./m${eI("vRet")}</th><th class="${eC("rRet")}" style="color:var(--purple)" onclick="hExecSort('rRet')">Rent Ret./m${eI("rRet")}</th>
+        <th class="${eC("act")}" style="color:var(--green)" onclick="hExecSort('act')">Act.${eI("act")}</th><th class="${eC("vAct")}" style="color:#2dd4bf" onclick="hExecSort('vAct')">Vta Nt./m${eI("vAct")}</th><th class="${eC("rAct")}" style="color:#c084fc" onclick="hExecSort('rAct')">Rent Nt./m${eI("rAct")}</th>
+        <th class="${eC("balV")}" onclick="hExecSort('balV')">Bal.Vta/m${eI("balV")}</th><th class="${eC("balR")}" onclick="hExecSort('balR')">Bal.Rent/m${eI("balR")}</th>
         ${a._tramosData&&dim==="local"?`<th style="color:var(--blue)">Tramos</th><th style="color:var(--blue)">Items/Tr.</th>`:""}
       </tr></thead><tbody>${tblData.map(d=>{
         let tramoCols="";
@@ -1310,6 +1370,7 @@ function renderResults(app){
 
     <div class="crd" style="border-left:3px solid var(--green)"><div style="font-size:11px;font-weight:700;color:var(--green);margin-bottom:6px">METODOLOGÍA</div><div style="font-size:11px;color:var(--tx3);line-height:1.7">
       <strong style="color:var(--tx)">Score:</strong> <span class="mono" style="color:var(--yellow)">0.40×%Rent + 0.25×%Vta + 0.20×%Uds + 0.15×%Mrg</span> · Corte: &lt;25<br>
+      <strong style="color:var(--tx)">Promedios:</strong> Basado en promedios mensuales (total ÷ meses activos). Items &lt;4 meses excluidos.<br>
       <strong style="color:var(--tx)">Comparación:</strong> Dentro de Local + ${a.isMultiClasif?"Clasificación + ":""}Sub Clasificación<br>
       <strong style="color:var(--tx)">Canibalización:</strong> 20-65% según densidad de items en la ${a.isMultiClasif?"clasif. + ":""}sub clasif. del local destino<br>
       <strong style="color:var(--tx)">Activación:</strong> Items con score≥40 en ≥2 locales similares (coseno &gt;30%)${a.isMultiClasif?"<br><strong style=\"color:var(--tx)\">Multi-clasif.:</strong> Similitud entre locales calculada con todo el archivo junto":""}
@@ -1321,8 +1382,9 @@ function renderResults(app){
     const pi=pageOf(items);
     content=`<div class="dl-bar"><button class="btn btn-s btn-sm" onclick="dlCSVRetiro()">⬇ CSV Retiro (${items.length})</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel Completo</button></div>`;
     if(!items.length)content+=`<div style="text-align:center;padding:30px;color:var(--tx4)">Sin items.</div>`;
-    else{content+=`<div class="scx"><table><thead><tr><th>Sev.</th>${TH2("local","Local")}${a.isMultiClasif?TH2("clasificacion","Clasif."):""}${TH2("subClasif","Sub Cl.")}${TH2("item","Item")}<th>Tam.</th>${TH2("marca","Marca")}<th>Prov.</th>${TH2("totalVenta","Vta$")}${TH2("totalCant","Uds")}${TH2("totalRent","Rent$")}${TH2("avgMargen","Mg%")}${TH2("pSales","%Vta")}${TH2("pUnits","%Uds")}${TH2("pRent","%Rnt")}${TH2("pMargin","%Mg")}${TH2("compositeScore","Score")}${a._tramosData?TH2("density","Densidad"):""}<th>Razones</th><th>N</th></tr></thead><tbody>${pi.map(it=>`<tr>
+    else{content+=`<div class="scx"><table><thead><tr><th>Sev.</th>${TH2("local","Local")}${a.isMultiClasif?TH2("clasificacion","Clasif."):""}${TH2("subClasif","Sub Cl.")}${TH2("item","Item")}<th>Tam.</th>${TH2("marca","Marca")}<th>Prov.</th>${TH2("mesesActivos","Mes")}${TH2("vtaPromMes","Vta/M")}${TH2("cantPromMes","Uds/M")}${TH2("rentPromMes","Rent/M")}${TH2("totalVenta","Vta$")}${TH2("totalCant","Uds")}${TH2("totalRent","Rent$")}${TH2("avgMargen","Mg%")}${TH2("pSales","%Vta")}${TH2("pUnits","%Uds")}${TH2("pRent","%Rnt")}${TH2("pMargin","%Mg")}${TH2("compositeScore","Score")}${a._tramosData?TH2("density","Densidad"):""}<th>Razones</th><th>N</th></tr></thead><tbody>${pi.map(it=>`<tr>
       <td>${bdg(it.compositeScore)}</td><td class="ell" style="max-width:140px;font-size:10px" title="${esc(it.local)}">${esc(it.local)}</td>${a.isMultiClasif?`<td style="font-size:9px;color:var(--blue)">${esc(it.clasificacion)}</td>`:""}<td style="font-size:9px">${esc(it.subClasif)}</td><td class="ell" style="max-width:180px" title="${esc(it.item)}">${esc(it.item)}</td><td style="font-size:9px">${esc(it.tamano)}</td><td style="color:var(--yellow);font-size:10px">${esc(it.marca)}</td><td style="font-size:9px;color:var(--tx4)">${esc(it.proveedor).substring(0,18)}</td>
+      <td class="mono" style="font-size:10px;color:${it.mesesActivos<6?"var(--orange)":"var(--tx3)"}">${it.mesesActivos}</td><td class="mono" style="font-size:10px;color:var(--blue)">$${fmt(it.vtaPromMes)}</td><td class="mono" style="font-size:10px;color:var(--blue)">${fI(it.cantPromMes)}</td><td class="mono" style="font-size:10px;color:var(--blue)">$${fmt(it.rentPromMes)}</td>
       <td class="mono" style="font-size:10px">$${fmt(it.totalVenta)}</td><td class="mono" style="font-size:10px">${fI(it.totalCant)}</td><td class="mono" style="font-size:10px">$${fmt(it.totalRent)}</td><td class="mono" style="font-size:10px;color:${it.avgMargen<0?"var(--red)":"var(--tx2)"}">${(it.avgMargen*100).toFixed(1)}%</td>
       <td>${bar(it.pSales)}</td><td>${bar(it.pUnits)}</td><td>${bar(it.pRent)}</td><td>${bar(it.pMargin)}</td>
       <td class="mono" style="font-weight:700;font-size:11px;color:${it.compositeScore<15?"var(--red)":"var(--orange)"}">${fS(it.compositeScore)}</td>
@@ -1357,21 +1419,21 @@ function renderResults(app){
     const sim=simulate(base,S.simLevel);
     const levels=[{id:"critico",label:"Críticos (<10)"},{id:"muy_bajo",label:"Crít+M.Bajo (<20)"},{id:"all",label:"Todos (<25)"}];
     const bR=Math.round(sim.pV*100),bRn=Math.round(sim.pR*100);
-    function simTbl(byObj,lbl){const arr=Object.entries(byObj).sort((a,b)=>b[1].rent-a[1].rent);if(!arr.length)return"";return`<div style="margin-top:10px"><div style="font-size:9px;font-weight:700;color:var(--tx3);margin-bottom:4px">POR ${lbl.toUpperCase()}</div><table><thead><tr><th>${lbl}</th><th>Items</th><th>Vta Perdida</th><th>Rent Perdida</th></tr></thead><tbody>${arr.slice(0,30).map(([k,d])=>`<tr><td style="font-weight:600;max-width:180px" class="ell">${esc(k)}</td><td class="mono">${d.n}</td><td class="mono" style="color:var(--orange)">$${fmt(d.vta)}</td><td class="mono" style="color:var(--purple)">$${fmt(d.rent)}</td></tr>`).join("")}</tbody></table></div>`;}
-    content=`<div class="sim-panel"><div style="font-size:13px;font-weight:800;margin-bottom:10px">Simulación de Retiro de Alcances</div>
+    function simTbl(byObj,lbl){const arr=Object.entries(byObj).sort((a,b)=>b[1].rentM-a[1].rentM);if(!arr.length)return"";return`<div style="margin-top:10px"><div style="font-size:9px;font-weight:700;color:var(--tx3);margin-bottom:4px">POR ${lbl.toUpperCase()}</div><table><thead><tr><th>${lbl}</th><th>Items</th><th>Vta/Mes</th><th>Rent/Mes</th></tr></thead><tbody>${arr.slice(0,30).map(([k,d])=>`<tr><td style="font-weight:600;max-width:180px" class="ell">${esc(k)}</td><td class="mono">${d.n}</td><td class="mono" style="color:var(--orange)">$${fmt(d.vtaM)}</td><td class="mono" style="color:var(--purple)">$${fmt(d.rentM)}</td></tr>`).join("")}</tbody></table></div>`;}
+    content=`<div class="sim-panel"><div style="font-size:13px;font-weight:800;margin-bottom:10px">Simulación de Retiro de Alcances (Mensual)</div>
       <div class="sim-tabs">${levels.map(l=>`<button class="sim-tab ${S.simLevel===l.id?"on":""}" onclick="ss({simLevel:'${l.id}'})">${l.label}</button>`).join("")}</div>
       <div class="sim-grid">
         <div class="sim-cell"><div class="v" style="color:var(--red)">${sim.rN.toLocaleString()}</div><div class="l">Items</div></div>
         <div class="sim-cell"><div class="v">${sim.uI}</div><div class="l">SKUs</div></div>
         <div class="sim-cell"><div class="v">${sim.uL}</div><div class="l">Locales</div></div>
-        <div class="sim-cell"><div class="v" style="color:var(--orange)">$${fmt(sim.rV)}</div><div class="l">Vta perdida</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--orange)">$${fmt(sim.rVM)}</div><div class="l">Vta perdida/mes</div></div>
         <div class="sim-cell"><div class="v" style="color:var(--green)">${fP(sim.pV)}</div><div class="l">% Imp. Vta</div></div>
-        <div class="sim-cell"><div class="v" style="color:var(--purple)">$${fmt(sim.rR)}</div><div class="l">Rent perdida</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--purple)">$${fmt(sim.rRM)}</div><div class="l">Rent perdida/mes</div></div>
         <div class="sim-cell"><div class="v" style="color:var(--purple)">${fP(sim.pR)}</div><div class="l">% Imp. Rent</div></div>
       </div>
-      <div style="font-size:9px;color:var(--tx3);margin-bottom:3px">VENTA: retener $${fmt(sim.aV)} vs perder $${fmt(sim.rV)}</div>
+      <div style="font-size:9px;color:var(--tx3);margin-bottom:3px">VENTA/MES: retener $${fmt(sim.aVM)} vs perder $${fmt(sim.rVM)}</div>
       <div class="sim-bar"><div style="width:${100-bR}%;background:var(--green)">${100-bR>5?(100-bR)+"%":""}</div><div style="width:${bR}%;background:var(--red)">${bR>3?bR+"%":""}</div></div>
-      <div style="font-size:9px;color:var(--tx3);margin:6px 0 3px">RENTABILIDAD: retener $${fmt(sim.aR)} vs perder $${fmt(sim.rR)}</div>
+      <div style="font-size:9px;color:var(--tx3);margin:6px 0 3px">RENT/MES: retener $${fmt(sim.aRM)} vs perder $${fmt(sim.rRM)}</div>
       <div class="sim-bar"><div style="width:${100-bRn}%;background:var(--green)">${100-bRn>5?(100-bRn)+"%":""}</div><div style="width:${bRn}%;background:var(--purple)">${bRn>3?bRn+"%":""}</div></div>
       ${simTbl(sim.bySC,"Sub Clasif.")}
       ${simTbl(sim.byMarca,"Marca")}
@@ -1392,19 +1454,19 @@ function renderResults(app){
     const tNV=recos.reduce((s,r)=>s+(r.netVta||0),0),tNR=recos.reduce((s,r)=>s+(r.netRent||0),0);
     const tBV=recos.reduce((s,r)=>s+r.avgVta,0),tBR=recos.reduce((s,r)=>s+r.avgRent,0);
     const avgCn=recos.length?recos.reduce((s,r)=>s+(r.cannibRate||0),0)/recos.length:0;
-    content=`<div class="info-b info-green"><div style="font-size:11px;font-weight:700;color:var(--green)">Productos a Activar — Valores netos (descontada canibalización ~${(avgCn*100).toFixed(0)}%)</div><div style="font-size:10px;color:var(--tx3);margin-top:2px">Score≥40 en ≥2 locales similares. Canib. varía 20-65% según densidad de items en sub clasif.</div></div>
+    content=`<div class="info-b info-green"><div style="font-size:11px;font-weight:700;color:var(--green)">Productos a Activar — Valores mensuales netos (descontada canibalización ~${(avgCn*100).toFixed(0)}%)</div><div style="font-size:10px;color:var(--tx3);margin-top:2px">Score≥40 en ≥2 locales similares. Canib. varía 20-65% según densidad de items en sub clasif. Valores basados en promedios mensuales.</div></div>
     <div class="dl-bar"><button class="btn btn-s btn-sm" onclick="dlCSVActivar()">⬇ CSV Activar (${recos.length})</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel Completo</button></div>
     <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
       <div class="stat"><div class="stat-v" style="color:var(--green)">${recos.length.toLocaleString()}</div><div class="stat-l">Oportunidades</div></div>
       <div class="stat"><div class="stat-v">${new Set(recos.map(r=>r.item)).size}</div><div class="stat-l">SKUs</div></div>
       <div class="stat"><div class="stat-v">${new Set(recos.map(r=>r.targetLocal)).size}</div><div class="stat-l">Locales</div></div>
-      <div class="stat"><div class="stat-v" style="color:#2dd4bf">$${fmt(tNV)}</div><div class="stat-l">Vta neta</div></div>
-      <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tNR)}</div><div class="stat-l">Rent neta</div></div>
+      <div class="stat"><div class="stat-v" style="color:#2dd4bf">$${fmt(tNV)}</div><div class="stat-l">Vta neta/mes</div></div>
+      <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tNR)}</div><div class="stat-l">Rent neta/mes</div></div>
       <div class="stat"><div class="stat-v" style="color:var(--tx3)">~${(avgCn*100).toFixed(0)}%</div><div class="stat-l">Canib. prom.</div></div>
     </div>
     ${(()=>{const sl=a._satLevel?SAT_LEVELS[a._satLevel]:null;const hasSwaps=recos.some(r=>r.swapOpportunity);if(!sl||a._satLevel==="no_saturada")return hasSwaps?`<div class="info-b info-green"><div style="font-size:10px;color:var(--green)"><span style="font-size:12px">⇄</span> = hay items de bajo rendimiento en la misma SC del local que se pueden retirar para dar espacio.</div></div>`:"";return`<div class="info-b info-amber"><div style="font-size:10px;color:var(--orange)">Saturación: <strong>${sl.label}</strong> — La fuerza de activación se ajusta por densidad y saturación.</div><div style="font-size:9px;color:var(--tx3);margin-top:3px"><span style="color:var(--orange)">●</span> = alta densidad · <span style="color:var(--green)">⇄</span> = swap posible (items a retirar liberan espacio) · Oportunidades fuertes (score≥60) o con swap disponible no se penalizan tanto.</div></div>`;})()}
     ${!recos.length?`<div style="text-align:center;padding:30px;color:var(--tx4)">Sin recomendaciones.</div>`:`
-    <div class="scx"><table><thead><tr>${TH2("targetLocal","Local Dest.")}${a.isMultiClasif?TH2("clasificacion","Clasif."):""}${TH2("item","Item")}${TH2("subClasif","Sub Cl.")}${TH2("marca","Marca")}<th>Tam.</th>${TH2("storesCarrying","Loc.")}${a._tramosData?`${TH2("tramos","Tramos")}${TH2("density","It/Tr.")}`:""} ${TH2("netRent","Rent Nt.")}${TH2("netVta","Vta Nt.")}${TH2("netCant","Uds Nt.")}${TH2("avgMrg","Mg%")}${TH2("cannibRate","Canib.")}${TH2("avgScore","Score")}${TH2("strength","Fuerza")}<th>Razón</th><th>Loc. Ref.</th></tr></thead><tbody>${pr.map(r=>`<tr>
+    <div class="scx"><table><thead><tr>${TH2("targetLocal","Local Dest.")}${a.isMultiClasif?TH2("clasificacion","Clasif."):""}${TH2("item","Item")}${TH2("subClasif","Sub Cl.")}${TH2("marca","Marca")}<th>Tam.</th>${TH2("storesCarrying","Loc.")}${a._tramosData?`${TH2("tramos","Tramos")}${TH2("density","It/Tr.")}`:""} ${TH2("netRent","Rent/m")}${TH2("netVta","Vta/m")}${TH2("netCant","Uds/m")}${TH2("avgMrg","Mg%")}${TH2("cannibRate","Canib.")}${TH2("avgScore","Score")}${TH2("strength","Fuerza")}<th>Razón</th><th>Loc. Ref.</th></tr></thead><tbody>${pr.map(r=>`<tr>
       <td class="ell" style="max-width:140px;font-size:10px" title="${esc(r.targetLocal)}">${r.densityWarning?`<span style="color:var(--orange)" title="Alta densidad">●</span> `:""}${r.swapOpportunity?`<span style="color:var(--green)" title="${esc(r.nFlaggedInSC+' items a retirar — swap')}">⇄</span> `:""}${esc(r.targetLocal)}</td>
       ${a.isMultiClasif?`<td style="font-size:9px;color:var(--blue)">${esc(r.clasificacion)}</td>`:""}<td class="ell" style="max-width:180px" title="${esc(r.item)}">${esc(r.item)}</td>
       <td style="font-size:9px">${esc(r.subClasif)}</td><td style="color:var(--yellow);font-size:10px">${esc(r.marca)}</td><td style="font-size:9px">${esc(r.tamano||"")}</td>
@@ -1432,18 +1494,18 @@ function renderResults(app){
     const cannibV=tBV-tNV,cannibR=tBR-tNR;
     function grpAct(field){const m={};AR.forEach(r=>{const k=r[field];if(!m[k])m[k]={n:0,vBr:0,rBr:0,vNt:0,rNt:0};m[k].n++;m[k].vBr+=r.avgVta;m[k].rBr+=r.avgRent;m[k].vNt+=(r.netVta||0);m[k].rNt+=(r.netRent||0);});return Object.entries(m).sort((a,b)=>b[1].rNt-a[1].rNt);}
     function actTbl(arr,lbl){if(!arr.length)return"";return`<div style="margin-top:10px"><div style="font-size:9px;font-weight:700;color:var(--tx3);margin-bottom:4px">POR ${lbl.toUpperCase()}</div><table><thead><tr><th>${lbl}</th><th>Oport.</th><th>Vta Bruta</th><th>Vta Neta</th><th>Rent Bruta</th><th>Rent Neta</th></tr></thead><tbody>${arr.slice(0,30).map(([k,d])=>`<tr><td style="font-weight:600;max-width:180px" class="ell">${esc(k)}</td><td class="mono">${d.n}</td><td class="mono" style="color:var(--tx3)">$${fmt(d.vBr)}</td><td class="mono" style="color:var(--green)">$${fmt(d.vNt)}</td><td class="mono" style="color:var(--tx3)">$${fmt(d.rBr)}</td><td class="mono" style="color:#c084fc">$${fmt(d.rNt)}</td></tr>`).join("")}</tbody></table></div>`;}
-    content=`<div class="sim-panel"><div style="font-size:13px;font-weight:800;margin-bottom:10px">Simulación de Activación (con Canibalización)</div>
-      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Canibalización: 20-65% según densidad de items existentes en la sub clasif. del local destino.</div>
+    content=`<div class="sim-panel"><div style="font-size:13px;font-weight:800;margin-bottom:10px">Simulación de Activación (Promedios Mensuales)</div>
+      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Valores en promedios mensuales. Canibalización: 20-65% según densidad de items existentes en la sub clasif. del local destino.</div>
       <div class="sim-grid">
         <div class="sim-cell"><div class="v" style="color:var(--green)">${AR.length.toLocaleString()}</div><div class="l">Oportunidades</div></div>
         <div class="sim-cell"><div class="v">${uSKU}</div><div class="l">SKUs</div></div>
         <div class="sim-cell"><div class="v">${uLoc}</div><div class="l">Locales</div></div>
-        <div class="sim-cell"><div class="v" style="color:var(--tx3)">$${fmt(tBV)}</div><div class="l">Vta bruta</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--tx3)">$${fmt(tBV)}</div><div class="l">Vta bruta/mes</div></div>
         <div class="sim-cell"><div class="v" style="color:var(--orange)">-$${fmt(cannibV)}</div><div class="l">Canibalización (~${(avgCn*100).toFixed(0)}%)</div></div>
-        <div class="sim-cell" style="border:1px solid var(--green);border-radius:6px"><div class="v" style="color:var(--green)">$${fmt(tNV)}</div><div class="l">VTA NETA INCREMENTAL</div></div>
-        <div class="sim-cell"><div class="v" style="color:var(--tx3)">$${fmt(tBR)}</div><div class="l">Rent bruta</div></div>
+        <div class="sim-cell" style="border:1px solid var(--green);border-radius:6px"><div class="v" style="color:var(--green)">$${fmt(tNV)}</div><div class="l">VTA NETA/MES</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--tx3)">$${fmt(tBR)}</div><div class="l">Rent bruta/mes</div></div>
         <div class="sim-cell"><div class="v" style="color:var(--orange)">-$${fmt(cannibR)}</div><div class="l">Canibalización rent</div></div>
-        <div class="sim-cell" style="border:1px solid #c084fc;border-radius:6px"><div class="v" style="color:#c084fc">$${fmt(tNR)}</div><div class="l">RENT NETA INCREMENTAL</div></div>
+        <div class="sim-cell" style="border:1px solid #c084fc;border-radius:6px"><div class="v" style="color:#c084fc">$${fmt(tNR)}</div><div class="l">RENT NETA/MES</div></div>
       </div>
       <div style="font-size:9px;color:var(--tx3);margin:8px 0 3px">VENTA: bruta vs canibalización vs neta</div>
       <div class="sim-bar"><div style="width:${Math.round((tNV/(tBV||1))*100)}%;background:var(--green)">${Math.round((tNV/(tBV||1))*100)}% neta</div><div style="width:${Math.round((cannibV/(tBV||1))*100)}%;background:var(--orange)">${Math.round((cannibV/(tBV||1))*100)}% canib.</div></div>
