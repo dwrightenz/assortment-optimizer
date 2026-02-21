@@ -70,9 +70,9 @@ const esc=s=>{const d=document.createElement("div");d.textContent=s;return d.inn
 
 // ═══ SATURATION LEVELS ═══
 const SAT_LEVELS={
-  muy_saturada:{label:"Muy Saturada",actMod:0.60,retMod:1.15,color:"var(--red)"},
-  saturada:{label:"Saturada",actMod:0.80,retMod:1.08,color:"var(--orange)"},
-  medio_saturada:{label:"Medio Saturada",actMod:0.92,retMod:1.03,color:"var(--yellow)"},
+  muy_saturada:{label:"Muy Saturada",actMod:0.50,retMod:1.15,color:"var(--red)"},
+  saturada:{label:"Saturada",actMod:0.70,retMod:1.08,color:"var(--orange)"},
+  medio_saturada:{label:"Medio Saturada",actMod:0.85,retMod:1.03,color:"var(--yellow)"},
   no_saturada:{label:"No Saturada",actMod:1.00,retMod:1.00,color:"var(--green)"}
 };
 
@@ -210,7 +210,7 @@ function runAnalysis(vd,ad){
     items.forEach(it=>{
       const pS=pctRank(sA,it.vtaPromMes),pU=pctRank(uA,it.cantPromMes),pR=pctRank(rA,it.rentPromMes),pM=pctRank(mA,it.avgMargen);
       const cs=W.sales*pS+W.units*pU+W.profitability*pR+W.margin*pM;
-      const fl=cs<TH&&!it.esImportado,ifl=cs<TH&&it.esImportado;
+      const fl=cs<TH&&!it.esImportado&&it.rentPromMes<=10,ifl=cs<TH&&it.esImportado;
       const rz=[];if(pS<TH)rz.push("Baja venta");if(pU<TH)rz.push("Baja rotación");if(pR<TH)rz.push("Baja rent.");if(pM<20)rz.push("Bajo margen");
       let sev="";if(cs<10)sev="CRITICO";else if(cs<20)sev="MUY_BAJO";else if(cs<TH)sev="BAJO";
       let ir="";if(ifl){if(pR<10&&pS<10)ir="Renegociar urgente";else if(pS<TH&&pU<TH)ir="Revisar exhibición/precio";else if(pR<TH&&pM<20)ir="Renegociar costo";else ir="Monitorear";}
@@ -222,6 +222,9 @@ function runAnalysis(vd,ad){
       bf[bk].subClasifs.add(it.subClasif);bf[bk].allItems.push(it);
       res.push(it);
     });
+    // Recovery rate per flagged item: how many non-flagged remain in same group
+    const nGood=items.filter(i=>!i.flagged&&!i.impFlagged).length;
+    items.forEach(it=>{it.recoveryRate=nGood>0?Math.min(0.50, 0.10 + (nGood/(nGood+4))*0.45):0;});
   });
   // Brand analysis: if ANY item has good performance, suggest partial removal
   const br=Object.values(bf).filter(b=>b.total>=3&&b.flagged/b.total>=BPT).map(b=>{
@@ -289,7 +292,7 @@ function buildActivationRecos(analysis,tramosData,satLevel){
 
           // Base penalty from density
           const densityPenalty=Math.min(0.5,Math.max(0,(density-3)/10));
-          tramosMod=Math.max(0.3,satConf.actMod*(1-densityPenalty));
+          tramosMod=Math.max(0.3,1-densityPenalty);
 
           // Swap opportunity: there are flagged items in same local+SC that can be retired to make room
           if(nFlagged>0){
@@ -307,7 +310,7 @@ function buildActivationRecos(analysis,tramosData,satLevel){
             if(!swapOpportunity)swapReason="Oportunidad fuerte (score "+aS.toFixed(0)+")";
           }
         }else{
-          tramosMod=satConf.actMod;
+          tramosMod=1;
           // Even without tramos data, note swap opportunities
           if(nFlagged>0){swapOpportunity=true;swapReason=nFlagged+" item(s) a retirar en misma SC";}
         }
@@ -327,7 +330,22 @@ function buildActivationRecos(analysis,tramosData,satLevel){
       }
     }
   }
-  recos.sort((a,b)=>b.strength-a.strength);return recos;
+  // Minimum netRent threshold: exclude activations below $15/mes
+  let filtered0=recos.filter(r=>r.netRent>=15);
+  filtered0.sort((a,b)=>b.strength-a.strength);
+  // Saturation filter: limit activations per local — prioritize by netRent
+  if(satConf.actMod<1){
+    const byLoc={};filtered0.forEach(r=>{if(!byLoc[r.targetLocal])byLoc[r.targetLocal]=[];byLoc[r.targetLocal].push(r);});
+    const filtered=[];
+    for(const[loc,lr] of Object.entries(byLoc)){
+      lr.sort((a,b)=>b.netRent-a.netRent);
+      const keep=Math.max(1,Math.round(lr.length*satConf.actMod));
+      filtered.push(...lr.slice(0,keep));
+    }
+    filtered.sort((a,b)=>b.strength-a.strength);
+    return filtered;
+  }
+  return filtered0;
 }
 
 // ═══ SIMULATION ═══
@@ -336,15 +354,25 @@ function simulate(results,level){
   const totVM=R.reduce((s,r)=>s+(r.vtaPromMes||0),0),totRM=R.reduce((s,r)=>s+(r.rentPromMes||0),0);
   let rem;
   if(level==="all")rem=R.filter(r=>r.flagged);else if(level==="critico")rem=R.filter(r=>r.flagged&&r.severity==="CRITICO");else if(level==="muy_bajo")rem=R.filter(r=>r.flagged&&(r.severity==="CRITICO"||r.severity==="MUY_BAJO"));else rem=[];
+  const remSet=new Set(rem.map(r=>r.local+"|||"+r.item));
   const rV=rem.reduce((s,r)=>s+r.totalVenta,0),rR=rem.reduce((s,r)=>s+r.totalRent,0),rU=rem.reduce((s,r)=>s+r.totalCant,0);
   const rVM=rem.reduce((s,r)=>s+(r.vtaPromMes||0),0),rRM=rem.reduce((s,r)=>s+(r.rentPromMes||0),0),rUM=rem.reduce((s,r)=>s+(r.cantPromMes||0),0);
+  // Recovery: count remaining (non-removed) items per local+subClasif
+  const scRemain={};R.forEach(r=>{const k=r.local+"|||"+r.subClasif;if(!scRemain[k])scRemain[k]=0;if(!remSet.has(r.local+"|||"+r.item))scRemain[k]++;});
+  // Calculate recovery per removed item: more remaining items = higher recovery
+  let recVtaM=0,recRentM=0;
+  rem.forEach(r=>{const k=r.local+"|||"+r.subClasif;const nRem=scRemain[k]||0;const recRate=nRem>0?Math.min(0.50, 0.10 + (nRem/(nRem+4))*0.45):0;recVtaM+=(r.vtaPromMes||0)*recRate;recRentM+=(r.rentPromMes||0)*recRate;});
+  const avgRecRate=rVM>0?(recVtaM/rVM):0;
   const bySC={},byMarca={},byProv={};
   rem.forEach(r=>{
-    if(!bySC[r.subClasif])bySC[r.subClasif]={n:0,vta:0,rent:0,vtaM:0,rentM:0};bySC[r.subClasif].n++;bySC[r.subClasif].vta+=r.totalVenta;bySC[r.subClasif].rent+=r.totalRent;bySC[r.subClasif].vtaM+=(r.vtaPromMes||0);bySC[r.subClasif].rentM+=(r.rentPromMes||0);
-    if(!byMarca[r.marca])byMarca[r.marca]={n:0,vta:0,rent:0,vtaM:0,rentM:0};byMarca[r.marca].n++;byMarca[r.marca].vta+=r.totalVenta;byMarca[r.marca].rent+=r.totalRent;byMarca[r.marca].vtaM+=(r.vtaPromMes||0);byMarca[r.marca].rentM+=(r.rentPromMes||0);
-    if(!byProv[r.proveedor])byProv[r.proveedor]={n:0,vta:0,rent:0,vtaM:0,rentM:0};byProv[r.proveedor].n++;byProv[r.proveedor].vta+=r.totalVenta;byProv[r.proveedor].rent+=r.totalRent;byProv[r.proveedor].vtaM+=(r.vtaPromMes||0);byProv[r.proveedor].rentM+=(r.rentPromMes||0);
+    const k=r.local+"|||"+r.subClasif;const nRem=scRemain[k]||0;const recRate=nRem>0?Math.min(0.50, 0.10 + (nRem/(nRem+4))*0.45):0;
+    const vtaNet=(r.vtaPromMes||0)*(1-recRate),rentNet=(r.rentPromMes||0)*(1-recRate);
+    if(!bySC[r.subClasif])bySC[r.subClasif]={n:0,vta:0,rent:0,vtaM:0,rentM:0,vtaN:0,rentN:0};bySC[r.subClasif].n++;bySC[r.subClasif].vta+=r.totalVenta;bySC[r.subClasif].rent+=r.totalRent;bySC[r.subClasif].vtaM+=(r.vtaPromMes||0);bySC[r.subClasif].rentM+=(r.rentPromMes||0);bySC[r.subClasif].vtaN+=vtaNet;bySC[r.subClasif].rentN+=rentNet;
+    if(!byMarca[r.marca])byMarca[r.marca]={n:0,vta:0,rent:0,vtaM:0,rentM:0,vtaN:0,rentN:0};byMarca[r.marca].n++;byMarca[r.marca].vta+=r.totalVenta;byMarca[r.marca].rent+=r.totalRent;byMarca[r.marca].vtaM+=(r.vtaPromMes||0);byMarca[r.marca].rentM+=(r.rentPromMes||0);byMarca[r.marca].vtaN+=vtaNet;byMarca[r.marca].rentN+=rentNet;
+    if(!byProv[r.proveedor])byProv[r.proveedor]={n:0,vta:0,rent:0,vtaM:0,rentM:0,vtaN:0,rentN:0};byProv[r.proveedor].n++;byProv[r.proveedor].vta+=r.totalVenta;byProv[r.proveedor].rent+=r.totalRent;byProv[r.proveedor].vtaM+=(r.vtaPromMes||0);byProv[r.proveedor].rentM+=(r.rentPromMes||0);byProv[r.proveedor].vtaN+=vtaNet;byProv[r.proveedor].rentN+=rentNet;
   });
-  return{totV,totR,totU,totN:R.length,totVM,totRM,rV,rR,rU,rN:rem.length,rVM,rRM,rUM,bySC,byMarca,byProv,uI:new Set(rem.map(r=>r.item)).size,uL:new Set(rem.map(r=>r.local)).size,
+  const netVM=rVM-recVtaM,netRM=rRM-recRentM;
+  return{totV,totR,totU,totN:R.length,totVM,totRM,rV,rR,rU,rN:rem.length,rVM,rRM,rUM,recVtaM,recRentM,avgRecRate,netVM,netRM,bySC,byMarca,byProv,uI:new Set(rem.map(r=>r.item)).size,uL:new Set(rem.map(r=>r.local)).size,
     pV:rV/(totV||1),pR:rR/(totR||1),pU:rU/(totU||1),pN:rem.length/(R.length||1),aV:totV-rV,aR:totR-rR,aVM:totVM-rVM,aRM:totRM-rRM};
 }
 
@@ -953,7 +981,7 @@ const S={step:"upload",ventasFiles:[],alcancesFiles:[],analysis:null,loading:fal
   execSort:"balR",execDir:"desc",analysisName:"",
 };
 let allLocals=[],allClasifs=[],allSCs=[],allMarcas=[],allProvs=[];
-function ss(p){Object.assign(S,p);render();}
+function ss(p){Object.assign(S,p);const ae=document.activeElement;const fi=ae&&ae.tagName==="INPUT"?{cls:ae.className,ph:ae.placeholder,pos:ae.selectionStart}:null;render();if(fi){const inputs=document.querySelectorAll("input");for(const inp of inputs){if(inp.className===fi.cls&&inp.placeholder===fi.ph){inp.focus();if(fi.pos!=null)try{inp.setSelectionRange(fi.pos,fi.pos);}catch(e){}break;}}}}
 function readF(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>{try{res(XLSX.read(new Uint8Array(e.target.result),{type:"array"}))}catch(e2){rej(e2)}};r.onerror=()=>rej(new Error("Error leyendo archivo"));r.readAsArrayBuffer(file);});}
 
 async function analyze(){
@@ -1084,7 +1112,7 @@ function TH2(col,label){return`<th class="${sC(col)}" onclick="hSort('${col}')">
 function multiSel(id,label,opts,sel,ph){
   const isO=S.openDrop===id;const chips=[...sel].map(v=>`<span class="fchip" onclick="event.stopPropagation();toggleSel('${id}','${esc(v.replace(/'/g,"\\'"))}')">${esc(v.length>20?v.substring(0,20)+"…":v)}<span class="x">×</span></span>`).join("");
   let dh="";if(isO){const sq=S.dropSearch.toLowerCase();const fo=opts.filter(o=>!sq||o.toLowerCase().includes(sq));
-  dh=`<div class="fdrop" onclick="event.stopPropagation()"><input class="fdrop-search" placeholder="Buscar..." value="${esc(S.dropSearch)}" oninput="S.dropSearch=this.value;render();"><div style="max-height:180px;overflow-y:auto">${fo.slice(0,80).map(o=>{const s=sel.has(o);return`<div class="fdrop-item ${s?"sel":""}" onclick="toggleSel('${id}','${esc(o.replace(/'/g,"\\'"))}')"><span class="ck">${s?"✓":""}</span><span class="ell" style="max-width:200px">${esc(o)}</span></div>`;}).join("")}</div><div class="fdrop-actions"><button onclick="clearSel('${id}')">Limpiar</button><button onclick="ss({openDrop:null})">Cerrar</button></div></div>`;}
+  dh=`<div class="fdrop" onclick="event.stopPropagation()"><input class="fdrop-search" placeholder="Buscar..." value="${esc(S.dropSearch)}" oninput="S.dropSearch=this.value;ss({});"><div style="max-height:180px;overflow-y:auto">${fo.slice(0,80).map(o=>{const s=sel.has(o);return`<div class="fdrop-item ${s?"sel":""}" onclick="toggleSel('${id}','${esc(o.replace(/'/g,"\\'"))}')"><span class="ck">${s?"✓":""}</span><span class="ell" style="max-width:200px">${esc(o)}</span></div>`;}).join("")}</div><div class="fdrop-actions"><button onclick="clearSel('${id}')">Limpiar</button><button onclick="ss({openDrop:null})">Cerrar</button></div></div>`;}
   return`<div class="fg"><label>${label}${sel.size?` <span style="color:var(--green)">(${sel.size})</span>`:""}</label><input class="finput" placeholder="${ph}" readonly onclick="event.stopPropagation();ss({openDrop:S.openDrop==='${id}'?null:'${id}',dropSearch:''})" value="${sel.size?sel.size+' sel.':''}" style="cursor:pointer;${sel.size?"border-color:var(--green);color:var(--green)":""}">${dh}${sel.size?`<div class="fchips">${chips}</div>`:""}</div>`;
 }
 
@@ -1096,6 +1124,7 @@ window.doExportExcel=function(){
   try{_buildExcel(S.analysis,getFiltered());}catch(e){alert("Error: "+e.message);console.error(e);}
 };
 window.resetApp=function(){ss({step:"upload",analysis:null,ventasFiles:[],alcancesFiles:[],analysisName:"",selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,satLevel:"no_saturada",tramosFile:null,tramosPreview:null});};
+window.changeSat=function(level){S.satLevel=level;if(S.analysis){S.analysis._satLevel=level;S.analysis.activationRecos=buildActivationRecos(S.analysis,S.analysis._tramosData||null,level);}render();};
 window.setNF=function(f,v){const x=v===""?null:parseFloat(v);ss({[f]:isNaN(x)?null:x,page:0});};
 window.applyPreset=function(p){const pr={"conVenta":{nfVentaMin:0.01,nfVentaMax:null},"sinVenta":{nfVentaMin:null,nfVentaMax:0},"rentPos":{nfRentMin:0.01,nfRentMax:null},"rentNeg":{nfRentMin:null,nfRentMax:0},"sCrit":{nfScoreMin:null,nfScoreMax:10},"sMB":{nfScoreMin:null,nfScoreMax:20},"clear":{nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null}};if(pr[p])ss({...pr[p],page:0});};
 window.hasAnyNF=function(){return[S.nfVentaMin,S.nfVentaMax,S.nfCantMin,S.nfCantMax,S.nfRentMin,S.nfRentMax,S.nfMargenMin,S.nfMargenMax,S.nfScoreMin,S.nfScoreMax].some(v=>v!==null);};
@@ -1144,10 +1173,7 @@ function renderUpload(app){
       <div style="font-size:9px;color:var(--tx4);margin-top:3px">${S.ventasFiles.length} archivos seleccionados</div>
     </div>`:""}
     <div class="crd" style="margin-top:4px;padding:12px 14px">
-      <div style="font-size:9px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Nivel de Saturación de Góndola</div>
-      <div class="nf-presets">${Object.entries(SAT_LEVELS).map(([k,v])=>`<button class="nf-pre ${S.satLevel===k?"on":""}" onclick="ss({satLevel:'${k}'})" style="${S.satLevel===k?"border-color:"+v.color+";color:"+v.color:""}">${v.label}</button>`).join("")}</div>
-      <div style="font-size:9px;color:var(--tx4);margin-top:2px">Mod. activación: ${SAT_LEVELS[S.satLevel].actMod.toFixed(2)}x · Mod. retiro: ${SAT_LEVELS[S.satLevel].retMod.toFixed(2)}x</div>
-      ${(()=>{const cl=S.ventasFiles.length?extractClasifName(S.ventasFiles[0].name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="margin-top:8px;display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
+      ${(()=>{const cl=S.ventasFiles.length?extractClasifName(S.ventasFiles[0].name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
     </div>
     ${S.error?`<div style="color:var(--red);margin-bottom:10px;font-size:12px;text-align:center">${esc(S.error)}</div>`:""}
     <div style="text-align:center"><button class="btn ${S.ventasFiles.length&&S.alcancesFiles.length?"btn-p":"btn-s"}" onclick="analyze()" ${S.loading||!S.ventasFiles.length||!S.alcancesFiles.length?"disabled":""}>${S.loading?'<span class="spin"></span> Procesando...':"Analizar Surtido"}</button></div>
@@ -1274,12 +1300,16 @@ function renderResults(app){
   if(S.tab==="exec"){
     const F=base.filter(i=>i.flagged),vt=base.reduce((s,r)=>s+r.vtaPromMes,0),vf=F.reduce((s,r)=>s+r.vtaPromMes,0),rt=base.reduce((s,r)=>s+r.rentPromMes,0),rf=F.reduce((s,r)=>s+r.rentPromMes,0);
     const vtAll=a.results.reduce((s,r)=>s+r.vtaPromMes,0),rtAll=a.results.reduce((s,r)=>s+r.rentPromMes,0);
+    // Recovery from retiro
+    const recVf=F.reduce((s,r)=>s+r.vtaPromMes*(r.recoveryRate||0),0),recRf=F.reduce((s,r)=>s+r.rentPromMes*(r.recoveryRate||0),0);
+    const avgRecRate=vf>0?(recVf/vf):0;
+    const netVf=vf-recVf,netRf=rf-recRf;
     const crit=F.filter(x=>x.severity==="CRITICO"),muyB=F.filter(x=>x.severity==="MUY_BAJO");
     const AR=recos;
     const arVBruta=AR.reduce((s,r)=>s+r.avgVta,0),arRBruta=AR.reduce((s,r)=>s+r.avgRent,0);
     const arVNeta=AR.reduce((s,r)=>s+(r.netVta||0),0),arRNeta=AR.reduce((s,r)=>s+(r.netRent||0),0);
     const avgCannib=AR.length?AR.reduce((s,r)=>s+(r.cannibRate||0),0)/AR.length:0;
-    const balV=arVNeta-vf,balR=arRNeta-rf;
+    const balV=arVNeta-netVf,balR=arRNeta-netRf;
 
     // ── Dimension table (unified) ──
     const dim=S.resDim||"subClasif";
@@ -1290,30 +1320,31 @@ function renderResults(app){
 
     // Group base by dimension
     const byDimR={};
-    base.forEach(r=>{const k=r[dimField];if(!byDimR[k])byDimR[k]={t:0,fl:0,vfl:0,rfl:0,vtot:0,rtot:0,imp:0};const o=byDimR[k];o.t++;o.vtot+=r.vtaPromMes;o.rtot+=r.rentPromMes;if(r.flagged){o.fl++;o.vfl+=r.vtaPromMes;o.rfl+=r.rentPromMes;}if(r.impFlagged)o.imp++;});
+    base.forEach(r=>{const k=r[dimField];if(!byDimR[k])byDimR[k]={t:0,fl:0,vfl:0,rfl:0,vflN:0,rflN:0,vtot:0,rtot:0,imp:0};const o=byDimR[k];o.t++;o.vtot+=r.vtaPromMes;o.rtot+=r.rentPromMes;if(r.flagged){o.fl++;o.vfl+=r.vtaPromMes;o.rfl+=r.rentPromMes;const rc=r.recoveryRate||0;o.vflN+=r.vtaPromMes*(1-rc);o.rflN+=r.rentPromMes*(1-rc);}if(r.impFlagged)o.imp++;});
     // Group recos by dimension
     const byDimA={};
     AR.forEach(r=>{const k=r[recoDimField];if(!byDimA[k])byDimA[k]={n:0,vNt:0,rNt:0};const o=byDimA[k];o.n++;o.vNt+=(r.netVta||0);o.rNt+=(r.netRent||0);});
     // Merge
     const allDimKeys=[...new Set([...Object.keys(byDimR),...Object.keys(byDimA)])];
-    let tblData=allDimKeys.map(k=>{const r=byDimR[k]||{t:0,fl:0,vfl:0,rfl:0,vtot:0,rtot:0,imp:0};const ac=byDimA[k]||{n:0,vNt:0,rNt:0};return{key:k,total:r.t,ret:r.fl,pRet:r.fl/(r.t||1),imp:r.imp,vRet:r.vfl,rRet:r.rfl,vTot:r.vtot,rTot:r.rtot,act:ac.n,vAct:ac.vNt,rAct:ac.rNt,balV:ac.vNt-r.vfl,balR:ac.rNt-r.rfl};});
+    let tblData=allDimKeys.map(k=>{const r=byDimR[k]||{t:0,fl:0,vfl:0,rfl:0,vflN:0,rflN:0,vtot:0,rtot:0,imp:0};const ac=byDimA[k]||{n:0,vNt:0,rNt:0};return{key:k,total:r.t,ret:r.fl,pRet:r.fl/(r.t||1),imp:r.imp,vRet:r.vfl,rRet:r.rfl,vRetN:r.vflN,rRetN:r.rflN,vTot:r.vtot,rTot:r.rtot,act:ac.n,vAct:ac.vNt,rAct:ac.rNt,balV:ac.vNt-r.vflN,balR:ac.rNt-r.rflN};});
     {const ek=S.execSort||"ret",ed=S.execDir==="asc"?1:-1;tblData.sort((a,b)=>{const av=a[ek],bv=b[ek];if(typeof av==="string")return(av||"").localeCompare(bv||"")*ed;return((av||0)-(bv||0))*ed;});}
     // Totals
     const tRet=tblData.reduce((s,d)=>s+d.ret,0),tAct=tblData.reduce((s,d)=>s+d.act,0);
     const tVR=tblData.reduce((s,d)=>s+d.vRet,0),tRR=tblData.reduce((s,d)=>s+d.rRet,0);
+    const tVRN=tblData.reduce((s,d)=>s+d.vRetN,0),tRRN=tblData.reduce((s,d)=>s+d.rRetN,0);
     const tVA=tblData.reduce((s,d)=>s+d.vAct,0),tRA=tblData.reduce((s,d)=>s+d.rAct,0);
 
     content=`<div style="font-size:18px;font-weight:800;margin-bottom:12px">${CL?CL+" — ":""}Resumen Ejecutivo</div>
     <div class="exec">
       <div class="exec-card" style="border-top:3px solid var(--tx)"><h4>Analizados</h4><div class="exec-big">${base.length.toLocaleString()}</div><div class="exec-sub">${uI} SKUs · ${new Set(base.map(r=>r.local)).size} locales${a.isMultiClasif?" · "+a.clasificaciones.length+" clasif.":""} · ${new Set(base.map(r=>r.subClasif)).size} sub clasif.</div></div>
       <div class="exec-card" style="border-top:3px solid var(--red)"><h4>Retiro Alcances</h4><div class="exec-big" style="color:var(--red)">${F.length.toLocaleString()}</div><div class="exec-sub">${crit.length} crít. · ${muyB.length} m.bajo · ${F.length-crit.length-muyB.length} bajo</div></div>
-      <div class="exec-card" style="border-top:3px solid var(--orange)"><h4>Venta Perdida /mes</h4><div class="exec-big" style="color:var(--orange)">$${fmt(vf)}</div><div class="exec-sub">${fP(vf/vtAll)} de $${fmt(vtAll)}/mes</div></div>
-      <div class="exec-card" style="border-top:3px solid var(--purple)"><h4>Rent. Perdida /mes</h4><div class="exec-big" style="color:var(--purple)">$${fmt(rf)}</div><div class="exec-sub">${fP(rf/rtAll)} de $${fmt(rtAll)}/mes</div></div>
+      <div class="exec-card" style="border-top:3px solid var(--orange)"><h4>Vta Neta Perdida /mes</h4><div class="exec-big" style="color:var(--orange)">$${fmt(netVf)}</div><div class="exec-sub">Bruta $${fmt(vf)} · Recup. ~${(avgRecRate*100).toFixed(0)}%</div></div>
+      <div class="exec-card" style="border-top:3px solid var(--purple)"><h4>Rent Neta Perdida /mes</h4><div class="exec-big" style="color:var(--purple)">$${fmt(netRf)}</div><div class="exec-sub">Bruta $${fmt(rf)} · Recup. ~${(avgRecRate*100).toFixed(0)}%</div></div>
       <div class="exec-card" style="border-top:3px solid var(--green)"><h4>Activación</h4><div class="exec-big" style="color:var(--green)">${AR.length.toLocaleString()}</div><div class="exec-sub">${new Set(AR.map(r=>r.item)).size} SKUs · ${new Set(AR.map(r=>r.targetLocal)).size} locales</div></div>
       <div class="exec-card" style="border-top:3px solid #2dd4bf"><h4>Vta Neta Act. /mes</h4><div class="exec-big" style="color:#2dd4bf">$${fmt(arVNeta)}</div><div class="exec-sub">Bruta $${fmt(arVBruta)} · Canib. ~${(avgCannib*100).toFixed(0)}%</div></div>
       <div class="exec-card" style="border-top:3px solid #c084fc"><h4>Rent Neta Act. /mes</h4><div class="exec-big" style="color:#c084fc">$${fmt(arRNeta)}</div><div class="exec-sub">Bruta $${fmt(arRBruta)}</div></div>
-      <div class="exec-card" style="border-top:3px solid ${balV>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Vta. /mes</h4><div class="exec-big" style="color:${balV>=0?"var(--green)":"var(--red)"}">$${fmt(balV)}</div><div class="exec-sub">Act. $${fmt(arVNeta)} − Ret. $${fmt(vf)}</div></div>
-      <div class="exec-card" style="border-top:3px solid ${balR>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Rent. /mes</h4><div class="exec-big" style="color:${balR>=0?"var(--green)":"var(--red)"}">$${fmt(balR)}</div><div class="exec-sub">Act. $${fmt(arRNeta)} − Ret. $${fmt(rf)}</div></div>
+      <div class="exec-card" style="border-top:3px solid ${balV>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Vta. /mes</h4><div class="exec-big" style="color:${balV>=0?"var(--green)":"var(--red)"}">$${fmt(balV)}</div><div class="exec-sub">Act. $${fmt(arVNeta)} − Ret. $${fmt(netVf)}</div></div>
+      <div class="exec-card" style="border-top:3px solid ${balR>=0?"var(--green)":"var(--red)"}"><h4>Balance Neto Rent. /mes</h4><div class="exec-big" style="color:${balR>=0?"var(--green)":"var(--red)"}">$${fmt(balR)}</div><div class="exec-sub">Act. $${fmt(arRNeta)} − Ret. $${fmt(netRf)}</div></div>
       ${(()=>{const td=a._tramosData;if(!td)return"";const satC=SAT_LEVELS[a._satLevel||"no_saturada"];const locs=Object.keys(td);const densities=locs.map(l=>{const tr=td[l];const items=base.filter(r=>r.local===l).length;return items/tr;}).filter(d=>d>0);const avgD=densities.length?densities.reduce((s,d)=>s+d,0)/densities.length:0;return`<div class="exec-card" style="border-top:3px solid var(--blue)"><h4>Densidad Items/Tramo</h4><div class="exec-big" style="color:var(--blue)">${avgD.toFixed(1)}</div><div class="exec-sub">${satC.label} · ${locs.length} locales c/tramos</div></div>`;})()}
     </div>
 
@@ -1325,17 +1356,19 @@ function renderResults(app){
       <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
         <div class="stat"><div class="stat-v">${tblData.length}</div><div class="stat-l">${dimLabel}s</div></div>
         <div class="stat"><div class="stat-v" style="color:var(--red)">${tRet.toLocaleString()}</div><div class="stat-l">Retiros</div></div>
-        <div class="stat"><div class="stat-v" style="color:var(--orange)">$${fmt(tVR)}</div><div class="stat-l">Vta Ret./mes</div></div>
-        <div class="stat"><div class="stat-v" style="color:var(--purple)">$${fmt(tRR)}</div><div class="stat-l">Rent Ret./mes</div></div>
+        <div class="stat"><div class="stat-v" style="color:var(--orange)">$${fmt(tVRN)}</div><div class="stat-l">Vta Ret.Neta/m</div></div>
+        <div class="stat"><div class="stat-v" style="color:var(--green)">~${(avgRecRate*100).toFixed(0)}%</div><div class="stat-l">Recup.</div></div>
+        <div class="stat"><div class="stat-v" style="color:var(--purple)">$${fmt(tRRN)}</div><div class="stat-l">Rent Ret.Neta/m</div></div>
         <div class="stat"><div class="stat-v" style="color:var(--green)">${tAct.toLocaleString()}</div><div class="stat-l">Activaciones</div></div>
-        <div class="stat"><div class="stat-v" style="color:#2dd4bf">$${fmt(tVA)}</div><div class="stat-l">Vta Nt./mes</div></div>
-        <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tRA)}</div><div class="stat-l">Rent Nt./mes</div></div>
-        <div class="stat"><div class="stat-v" style="color:${(tRA-tRR)>=0?"var(--green)":"var(--red)"}">$${fmt(tRA-tRR)}</div><div class="stat-l">Bal.Rent/mes</div></div>
+        <div class="stat"><div class="stat-v" style="color:#2dd4bf">$${fmt(tVA)}</div><div class="stat-l">Vta Act.Neta/m</div></div>
+        <div class="stat"><div class="stat-v" style="color:var(--orange)">~${(avgCannib*100).toFixed(0)}%</div><div class="stat-l">Canib.</div></div>
+        <div class="stat"><div class="stat-v" style="color:#c084fc">$${fmt(tRA)}</div><div class="stat-l">Rent Act.Neta/m</div></div>
+        <div class="stat"><div class="stat-v" style="color:${(tRA-tRRN)>=0?"var(--green)":"var(--red)"}">$${fmt(tRA-tRRN)}</div><div class="stat-l">Bal.Rent/mes</div></div>
       </div>
       <div class="scx"><table><thead><tr>
         <th class="${eC("key")}" onclick="hExecSort('key')">${dimLabel}${eI("key")}</th><th class="${eC("total")}" onclick="hExecSort('total')">Total${eI("total")}</th>
         <th class="${eC("ret")}" style="color:var(--red)" onclick="hExecSort('ret')">Ret.${eI("ret")}</th><th class="${eC("pRet")}" onclick="hExecSort('pRet')">% Ret.${eI("pRet")}</th><th class="${eC("imp")}" style="color:var(--blue)" onclick="hExecSort('imp')">Imp.${eI("imp")}</th>
-        <th class="${eC("vRet")}" style="color:var(--orange)" onclick="hExecSort('vRet')">Vta Ret./m${eI("vRet")}</th><th class="${eC("rRet")}" style="color:var(--purple)" onclick="hExecSort('rRet')">Rent Ret./m${eI("rRet")}</th>
+        <th class="${eC("vRetN")}" style="color:var(--orange)" onclick="hExecSort('vRetN')">Vta Ret.Nt/m${eI("vRetN")}</th><th class="${eC("rRetN")}" style="color:var(--purple)" onclick="hExecSort('rRetN')">Rent Ret.Nt/m${eI("rRetN")}</th>
         <th class="${eC("act")}" style="color:var(--green)" onclick="hExecSort('act')">Act.${eI("act")}</th><th class="${eC("vAct")}" style="color:#2dd4bf" onclick="hExecSort('vAct')">Vta Nt./m${eI("vAct")}</th><th class="${eC("rAct")}" style="color:#c084fc" onclick="hExecSort('rAct')">Rent Nt./m${eI("rAct")}</th>
         <th class="${eC("balV")}" onclick="hExecSort('balV')">Bal.Vta/m${eI("balV")}</th><th class="${eC("balR")}" onclick="hExecSort('balR')">Bal.Rent/m${eI("balR")}</th>
         ${a._tramosData&&dim==="local"?`<th style="color:var(--blue)">Tramos</th><th style="color:var(--blue)">Items/Tr.</th>`:""}
@@ -1348,8 +1381,8 @@ function renderResults(app){
         <td class="mono" style="color:var(--red);font-weight:700">${d.ret}</td>
         <td class="mono" style="color:var(--tx3)">${(d.pRet*100).toFixed(1)}%</td>
         <td class="mono" style="color:var(--blue)">${d.imp}</td>
-        <td class="mono" style="color:var(--orange)">$${fmt(d.vRet)}</td>
-        <td class="mono" style="color:var(--purple)">$${fmt(d.rRet)}</td>
+        <td class="mono" style="color:var(--orange)">$${fmt(d.vRetN)}</td>
+        <td class="mono" style="color:var(--purple)">$${fmt(d.rRetN)}</td>
         <td class="mono" style="color:var(--green);font-weight:700">${d.act}</td>
         <td class="mono" style="color:#2dd4bf">$${fmt(d.vAct)}</td>
         <td class="mono" style="color:#c084fc">$${fmt(d.rAct)}</td>
@@ -1360,10 +1393,10 @@ function renderResults(app){
       <tr style="border-top:2px solid var(--bg4);font-weight:800">
         <td>TOTAL</td><td class="mono">${tblData.reduce((s,d)=>s+d.total,0)}</td>
         <td class="mono" style="color:var(--red)">${tRet}</td><td></td><td class="mono" style="color:var(--blue)">${tblData.reduce((s,d)=>s+d.imp,0)}</td>
-        <td class="mono" style="color:var(--orange)">$${fmt(tVR)}</td><td class="mono" style="color:var(--purple)">$${fmt(tRR)}</td>
+        <td class="mono" style="color:var(--orange)">$${fmt(tVRN)}</td><td class="mono" style="color:var(--purple)">$${fmt(tRRN)}</td>
         <td class="mono" style="color:var(--green)">${tAct}</td><td class="mono" style="color:#2dd4bf">$${fmt(tVA)}</td><td class="mono" style="color:#c084fc">$${fmt(tRA)}</td>
-        <td class="mono" style="color:${(tVA-tVR)>=0?"var(--green)":"var(--red)"};font-weight:800">$${fmt(tVA-tVR)}</td>
-        <td class="mono" style="color:${(tRA-tRR)>=0?"var(--green)":"var(--red)"};font-weight:800">$${fmt(tRA-tRR)}</td>
+        <td class="mono" style="color:${(tVA-tVRN)>=0?"var(--green)":"var(--red)"};font-weight:800">$${fmt(tVA-tVRN)}</td>
+        <td class="mono" style="color:${(tRA-tRRN)>=0?"var(--green)":"var(--red)"};font-weight:800">$${fmt(tRA-tRRN)}</td>
         ${a._tramosData&&dim==="local"?`<td></td><td></td>`:""}
       </tr></tbody></table></div>
     </div>
@@ -1382,12 +1415,13 @@ function renderResults(app){
     const pi=pageOf(items);
     content=`<div class="dl-bar"><button class="btn btn-s btn-sm" onclick="dlCSVRetiro()">⬇ CSV Retiro (${items.length})</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel Completo</button></div>`;
     if(!items.length)content+=`<div style="text-align:center;padding:30px;color:var(--tx4)">Sin items.</div>`;
-    else{content+=`<div class="scx"><table><thead><tr><th>Sev.</th>${TH2("local","Local")}${a.isMultiClasif?TH2("clasificacion","Clasif."):""}${TH2("subClasif","Sub Cl.")}${TH2("item","Item")}<th>Tam.</th>${TH2("marca","Marca")}<th>Prov.</th>${TH2("mesesActivos","Mes")}${TH2("vtaPromMes","Vta/M")}${TH2("cantPromMes","Uds/M")}${TH2("rentPromMes","Rent/M")}${TH2("totalVenta","Vta$")}${TH2("totalCant","Uds")}${TH2("totalRent","Rent$")}${TH2("avgMargen","Mg%")}${TH2("pSales","%Vta")}${TH2("pUnits","%Uds")}${TH2("pRent","%Rnt")}${TH2("pMargin","%Mg")}${TH2("compositeScore","Score")}${a._tramosData?TH2("density","Densidad"):""}<th>Razones</th><th>N</th></tr></thead><tbody>${pi.map(it=>`<tr>
+    else{content+=`<div class="scx"><table><thead><tr><th>Sev.</th>${TH2("local","Local")}${a.isMultiClasif?TH2("clasificacion","Clasif."):""}${TH2("subClasif","Sub Cl.")}${TH2("item","Item")}<th>Tam.</th>${TH2("marca","Marca")}<th>Prov.</th>${TH2("mesesActivos","Mes")}${TH2("vtaPromMes","Vta/M")}${TH2("cantPromMes","Uds/M")}${TH2("rentPromMes","Rent/M")}${TH2("totalVenta","Vta$")}${TH2("totalCant","Uds")}${TH2("totalRent","Rent$")}${TH2("avgMargen","Mg%")}${TH2("pSales","%Vta")}${TH2("pUnits","%Uds")}${TH2("pRent","%Rnt")}${TH2("pMargin","%Mg")}${TH2("compositeScore","Score")}${TH2("recoveryRate","Recup.")}${a._tramosData?TH2("density","Densidad"):""}<th>Razones</th><th>N</th></tr></thead><tbody>${pi.map(it=>`<tr>
       <td>${bdg(it.compositeScore)}</td><td class="ell" style="max-width:140px;font-size:10px" title="${esc(it.local)}">${esc(it.local)}</td>${a.isMultiClasif?`<td style="font-size:9px;color:var(--blue)">${esc(it.clasificacion)}</td>`:""}<td style="font-size:9px">${esc(it.subClasif)}</td><td class="ell" style="max-width:180px" title="${esc(it.item)}">${esc(it.item)}</td><td style="font-size:9px">${esc(it.tamano)}</td><td style="color:var(--yellow);font-size:10px">${esc(it.marca)}</td><td style="font-size:9px;color:var(--tx4)">${esc(it.proveedor).substring(0,18)}</td>
       <td class="mono" style="font-size:10px;color:${it.mesesActivos<6?"var(--orange)":"var(--tx3)"}">${it.mesesActivos}</td><td class="mono" style="font-size:10px;color:var(--blue)">$${fmt(it.vtaPromMes)}</td><td class="mono" style="font-size:10px;color:var(--blue)">${fI(it.cantPromMes)}</td><td class="mono" style="font-size:10px;color:var(--blue)">$${fmt(it.rentPromMes)}</td>
       <td class="mono" style="font-size:10px">$${fmt(it.totalVenta)}</td><td class="mono" style="font-size:10px">${fI(it.totalCant)}</td><td class="mono" style="font-size:10px">$${fmt(it.totalRent)}</td><td class="mono" style="font-size:10px;color:${it.avgMargen<0?"var(--red)":"var(--tx2)"}">${(it.avgMargen*100).toFixed(1)}%</td>
       <td>${bar(it.pSales)}</td><td>${bar(it.pUnits)}</td><td>${bar(it.pRent)}</td><td>${bar(it.pMargin)}</td>
       <td class="mono" style="font-weight:700;font-size:11px;color:${it.compositeScore<15?"var(--red)":"var(--orange)"}">${fS(it.compositeScore)}</td>
+      <td class="mono" style="font-size:10px;color:var(--green)">${((it.recoveryRate||0)*100).toFixed(0)}%</td>
       ${a._tramosData?`<td class="mono" style="font-size:10px;color:${it.density&&it.density>5?"var(--orange)":"var(--tx3)"}">${it.density!=null?it.density.toFixed(1):"—"}</td>`:""}<td>${it.reasons.map(r=>`<span class="tag">${esc(r)}</span>`).join("")}</td><td class="mono" style="font-size:9px;color:var(--tx4)">${it.groupSize}</td>
     </tr>`).join("")}</tbody></table></div>${pager(items.length,"items")}`;}
   }
@@ -1419,22 +1453,27 @@ function renderResults(app){
     const sim=simulate(base,S.simLevel);
     const levels=[{id:"critico",label:"Críticos (<10)"},{id:"muy_bajo",label:"Crít+M.Bajo (<20)"},{id:"all",label:"Todos (<25)"}];
     const bR=Math.round(sim.pV*100),bRn=Math.round(sim.pR*100);
-    function simTbl(byObj,lbl){const arr=Object.entries(byObj).sort((a,b)=>b[1].rentM-a[1].rentM);if(!arr.length)return"";return`<div style="margin-top:10px"><div style="font-size:9px;font-weight:700;color:var(--tx3);margin-bottom:4px">POR ${lbl.toUpperCase()}</div><table><thead><tr><th>${lbl}</th><th>Items</th><th>Vta/Mes</th><th>Rent/Mes</th></tr></thead><tbody>${arr.slice(0,30).map(([k,d])=>`<tr><td style="font-weight:600;max-width:180px" class="ell">${esc(k)}</td><td class="mono">${d.n}</td><td class="mono" style="color:var(--orange)">$${fmt(d.vtaM)}</td><td class="mono" style="color:var(--purple)">$${fmt(d.rentM)}</td></tr>`).join("")}</tbody></table></div>`;}
+    function simTbl(byObj,lbl){const arr=Object.entries(byObj).sort((a,b)=>b[1].rentN-a[1].rentN);if(!arr.length)return"";return`<div style="margin-top:10px"><div style="font-size:9px;font-weight:700;color:var(--tx3);margin-bottom:4px">POR ${lbl.toUpperCase()}</div><table><thead><tr><th>${lbl}</th><th>Items</th><th>Vta Bruta/M</th><th>Vta Neta/M</th><th>Rent Bruta/M</th><th>Rent Neta/M</th></tr></thead><tbody>${arr.slice(0,30).map(([k,d])=>`<tr><td style="font-weight:600;max-width:180px" class="ell">${esc(k)}</td><td class="mono">${d.n}</td><td class="mono" style="color:var(--tx3)">$${fmt(d.vtaM)}</td><td class="mono" style="color:var(--orange)">$${fmt(d.vtaN)}</td><td class="mono" style="color:var(--tx3)">$${fmt(d.rentM)}</td><td class="mono" style="color:var(--purple)">$${fmt(d.rentN)}</td></tr>`).join("")}</tbody></table></div>`;}
     content=`<div class="sim-panel"><div style="font-size:13px;font-weight:800;margin-bottom:10px">Simulación de Retiro de Alcances (Mensual)</div>
+      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Recuperación estimada ~${(sim.avgRecRate*100).toFixed(0)}%: productos similares en misma sub clasif. absorben parte de la demanda al retirar.</div>
       <div class="sim-tabs">${levels.map(l=>`<button class="sim-tab ${S.simLevel===l.id?"on":""}" onclick="ss({simLevel:'${l.id}'})">${l.label}</button>`).join("")}</div>
       <div class="sim-grid">
         <div class="sim-cell"><div class="v" style="color:var(--red)">${sim.rN.toLocaleString()}</div><div class="l">Items</div></div>
         <div class="sim-cell"><div class="v">${sim.uI}</div><div class="l">SKUs</div></div>
         <div class="sim-cell"><div class="v">${sim.uL}</div><div class="l">Locales</div></div>
-        <div class="sim-cell"><div class="v" style="color:var(--orange)">$${fmt(sim.rVM)}</div><div class="l">Vta perdida/mes</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--tx3)">$${fmt(sim.rVM)}</div><div class="l">Vta bruta/mes</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--green)">+$${fmt(sim.recVtaM)}</div><div class="l">Recuperación (~${(sim.avgRecRate*100).toFixed(0)}%)</div></div>
+        <div class="sim-cell" style="border:1px solid var(--orange);border-radius:6px"><div class="v" style="color:var(--orange)">$${fmt(sim.netVM)}</div><div class="l">VTA NETA PERDIDA/MES</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--tx3)">$${fmt(sim.rRM)}</div><div class="l">Rent bruta/mes</div></div>
+        <div class="sim-cell"><div class="v" style="color:var(--green)">+$${fmt(sim.recRentM)}</div><div class="l">Recuperación rent</div></div>
+        <div class="sim-cell" style="border:1px solid var(--purple);border-radius:6px"><div class="v" style="color:var(--purple)">$${fmt(sim.netRM)}</div><div class="l">RENT NETA PERDIDA/MES</div></div>
         <div class="sim-cell"><div class="v" style="color:var(--green)">${fP(sim.pV)}</div><div class="l">% Imp. Vta</div></div>
-        <div class="sim-cell"><div class="v" style="color:var(--purple)">$${fmt(sim.rRM)}</div><div class="l">Rent perdida/mes</div></div>
         <div class="sim-cell"><div class="v" style="color:var(--purple)">${fP(sim.pR)}</div><div class="l">% Imp. Rent</div></div>
       </div>
-      <div style="font-size:9px;color:var(--tx3);margin-bottom:3px">VENTA/MES: retener $${fmt(sim.aVM)} vs perder $${fmt(sim.rVM)}</div>
-      <div class="sim-bar"><div style="width:${100-bR}%;background:var(--green)">${100-bR>5?(100-bR)+"%":""}</div><div style="width:${bR}%;background:var(--red)">${bR>3?bR+"%":""}</div></div>
-      <div style="font-size:9px;color:var(--tx3);margin:6px 0 3px">RENT/MES: retener $${fmt(sim.aRM)} vs perder $${fmt(sim.rRM)}</div>
-      <div class="sim-bar"><div style="width:${100-bRn}%;background:var(--green)">${100-bRn>5?(100-bRn)+"%":""}</div><div style="width:${bRn}%;background:var(--purple)">${bRn>3?bRn+"%":""}</div></div>
+      <div style="font-size:9px;color:var(--tx3);margin-bottom:3px">VTA/MES: bruta $${fmt(sim.rVM)} − recuperación $${fmt(sim.recVtaM)} = neta $${fmt(sim.netVM)}</div>
+      <div class="sim-bar"><div style="width:${Math.round(((sim.rVM-sim.netVM)/(sim.rVM||1))*100)}%;background:var(--green)">${Math.round(sim.avgRecRate*100)}% recup.</div><div style="width:${Math.round((sim.netVM/(sim.rVM||1))*100)}%;background:var(--red)">${100-Math.round(sim.avgRecRate*100)}% pérdida</div></div>
+      <div style="font-size:9px;color:var(--tx3);margin:6px 0 3px">RENT/MES: bruta $${fmt(sim.rRM)} − recuperación $${fmt(sim.recRentM)} = neta $${fmt(sim.netRM)}</div>
+      <div class="sim-bar"><div style="width:${Math.round(((sim.rRM-sim.netRM)/(sim.rRM||1))*100)}%;background:var(--green)">${Math.round(sim.avgRecRate*100)}% recup.</div><div style="width:${Math.round((sim.netRM/(sim.rRM||1))*100)}%;background:var(--purple)">${100-Math.round(sim.avgRecRate*100)}% pérdida</div></div>
       ${simTbl(sim.bySC,"Sub Clasif.")}
       ${simTbl(sim.byMarca,"Marca")}
       ${simTbl(sim.byProv,"Proveedor")}
@@ -1524,8 +1563,9 @@ function renderResults(app){
 
   const clrAll=`ss({selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:'',page:0,nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null})`;
 
+  const _satBtns=Object.entries(SAT_LEVELS).map(([k,v])=>`<button class="nf-pre ${S.satLevel===k?"on":""}" onclick="changeSat('${k}')" style="font-size:8px;padding:2px 6px;${S.satLevel===k?"border-color:"+v.color+";color:"+v.color:""}">${v.label}</button>`).join("");
   app.innerHTML=`
-    <div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">${CL?CL+" — ":""}ASSORTMENT OPTIMIZER</span><span style="font-size:10px;color:var(--tx4);margin-left:8px">${base.length.toLocaleString()} items${aF>0?" (filtrado)":""} · ${new Set(base.map(r=>r.local)).size} loc${a.isMultiClasif?" · "+a.clasificaciones.length+" clasif.":""} · Sub clasif: ${new Set(base.map(r=>r.subClasif)).size}</span></div><div style="display:flex;gap:6px"><button class="btn btn-s btn-sm" onclick="goTramos()">⚙ Tramos</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel</button><button class="btn btn-sm" style="background:#7c3aed;color:#fff;border:none" onclick="doExportPPTX()">⬇ Presentación</button><button class="btn btn-s btn-sm" onclick="resetApp()">Nuevo</button></div></div>
+    <div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">${CL?CL+" — ":""}ASSORTMENT OPTIMIZER</span><span style="font-size:10px;color:var(--tx4);margin-left:8px">${base.length.toLocaleString()} items${aF>0?" (filtrado)":""} · ${new Set(base.map(r=>r.local)).size} loc${a.isMultiClasif?" · "+a.clasificaciones.length+" clasif.":""} · Sub clasif: ${new Set(base.map(r=>r.subClasif)).size}</span></div><div style="display:flex;align-items:center;gap:6px"><span style="font-size:8px;color:var(--tx4)">Saturación:</span><div class="nf-presets" style="margin:0;gap:3px">${_satBtns}</div><button class="btn btn-s btn-sm" onclick="goTramos()">⚙ Tramos</button><button class="btn btn-s btn-sm" onclick="doExportExcel()">⬇ Excel</button><button class="btn btn-sm" style="background:#7c3aed;color:#fff;border:none" onclick="doExportPPTX()">⬇ Presentación</button><button class="btn btn-s btn-sm" onclick="resetApp()">Nuevo</button></div></div>
     <div class="cnt">
       <div class="fbar">
         ${multiSel("locals","LOCAL",allLocals,S.selLocals,"Locales...")}
