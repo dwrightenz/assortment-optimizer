@@ -330,8 +330,8 @@ function buildActivationRecos(analysis,tramosData,satLevel){
       }
     }
   }
-  // Minimum netRent threshold: exclude activations below $15/mes
-  let filtered0=recos.filter(r=>r.netRent>=15);
+  // Minimum netRent threshold: exclude activations below $10/mes
+  let filtered0=recos.filter(r=>r.netRent>=10);
   filtered0.sort((a,b)=>b.strength-a.strength);
   // Saturation filter: limit activations per local — prioritize by netRent
   if(satConf.actMod<1){
@@ -491,17 +491,28 @@ function _buildExcel(a,fd){
   const byPR={};R.filter(r=>!r.esImportado&&r.flagged).forEach(r=>{if(!byPR[r.proveedor])byPR[r.proveedor]={fl:0,vfl:0,rfl:0};byPR[r.proveedor].fl++;byPR[r.proveedor].vfl+=r.vtaPromMes;byPR[r.proveedor].rfl+=r.rentPromMes;});
   const byPA={};(AR||[]).forEach(r=>{if(!byPA[r.proveedor])byPA[r.proveedor]={n:0,vNt:0,rNt:0};byPA[r.proveedor].n++;byPA[r.proveedor].vNt+=(r.netVta||0);byPA[r.proveedor].rNt+=(r.netRent||0);});
   [...new Set([...Object.keys(byPR),...Object.keys(byPA)])].sort((a,b)=>(byPR[b]||{fl:0}).fl-(byPR[a]||{fl:0}).fl).slice(0,30).forEach(k=>{const r=byPR[k]||{fl:0,vfl:0,rfl:0};const ac=byPA[k]||{n:0,vNt:0,rNt:0};if(r.fl||ac.n)rd.push([k,r.fl,r.vfl,r.rfl,"",ac.n,ac.vNt,ac.rNt]);});
-  const ws1=XLSX.utils.aoa_to_sheet(rd);ws1["!cols"]=[{wch:38},{wch:16},{wch:16},{wch:16},{wch:3},{wch:14},{wch:16},{wch:16}];
-  for(var _r=0;_r<rd.length;_r++){[1,2,3,5,6,7].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r,c:c});if(!ws1[ref]||ws1[ref].t!=='n')return;var v=ws1[ref].v;if(v===0)return;if(Math.abs(v)<1)ws1[ref].z=ZP;else if(Math.abs(v)>=100)ws1[ref].z=ZD;else ws1[ref].z=ZI;});}
+  const ws1=XLSX.utils.aoa_to_sheet(rd);ws1["!cols"]=[{wch:38},{wch:18},{wch:18},{wch:18},{wch:3},{wch:18},{wch:18},{wch:18}];
+  // Explicit formatting for Resumen: rows with known types
+  const _pctRows=new Set();const _dolRows=new Set();const _intRows=new Set();
+  rd.forEach((row,ri)=>{const lbl=(row[0]||"").toString().toLowerCase();if(lbl.includes("% imp")||lbl.includes("% retiro"))_pctRows.add(ri);else if(lbl.includes("venta")||lbl.includes("rent.")||lbl.includes("balance")||lbl.includes("canib"))_dolRows.add(ri);else if(lbl.includes("items")||lbl.includes("combinac")||lbl.includes("oportunid")||lbl.includes("skus")||lbl.includes("locales")||lbl.includes("import")||lbl.includes("marcas"))_intRows.add(ri);});
+  for(var _r=0;_r<rd.length;_r++){[1,2,3,5,6,7].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r,c:c});if(!ws1[ref]||ws1[ref].t!=='n')return;if(_pctRows.has(_r))ws1[ref].z=ZP;else if(_dolRows.has(_r))ws1[ref].z=ZD;else if(_intRows.has(_r))ws1[ref].z=ZI;else{var v=ws1[ref].v;if(Math.abs(v)<1&&Math.abs(v)>0)ws1[ref].z=ZP;else if(Math.abs(v)>=10)ws1[ref].z=ZD;else ws1[ref].z=ZS;}});}
+  // Group tables (por SC, Marca, Prov): col 1=int, cols 2-3 & 6-7=dollar
+  for(var _r=0;_r<rd.length;_r++){var r0=(rd[_r][0]||"").toString();if(rd[_r].length>=8&&typeof rd[_r][1]==='number'&&typeof rd[_r][2]==='number'){var c1=XLSX.utils.encode_cell({r:_r,c:1});if(ws1[c1])ws1[c1].z=ZI;[2,3,6,7].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r,c:c});if(ws1[ref]&&ws1[ref].t==='n')ws1[ref].z=ZD;});}}
   XLSX.utils.book_append_sheet(wb,ws1,"Resumen Ejecutivo");
 
   // ══ 2. Items Retirar ══
   const _mc=a.isMultiClasif;
   const hR=_mc?["Severidad","Local","Clasificación","Sub Clasif.","Item","Tamaño","Marca","Proveedor","Clase","Score","Meses","Vta/Mes","Uds/Mes","Rent/Mes","Venta $","Uds","Rent $","Margen %","%il Vta","%il Uds","%il Rent","%il Mrg","Razones","Grupo(n)"]:["Severidad","Local","Sub Clasif.","Item","Tamaño","Marca","Proveedor","Clase","Score","Meses","Vta/Mes","Uds/Mes","Rent/Mes","Venta $","Uds","Rent $","Margen %","%il Vta","%il Uds","%il Rent","%il Mrg","Razones","Grupo(n)"];
   const dR=F.map(i=>{const row=[i.severity==="CRITICO"?"CRÍTICO":i.severity==="MUY_BAJO"?"MUY BAJO":"BAJO",i.local];if(_mc)row.push(i.clasificacion||"");row.push(i.subClasif,i.item,i.tamano,i.marca,i.proveedor,i.claseMerc,+i.compositeScore.toFixed(1),i.mesesActivos,+i.vtaPromMes.toFixed(2),Math.round(i.cantPromMes),+i.rentPromMes.toFixed(2),+i.totalVenta.toFixed(2),Math.round(i.totalCant),+i.totalRent.toFixed(2),i.avgMargen,+i.pSales.toFixed(1),+i.pUnits.toFixed(1),+i.pRent.toFixed(1),+i.pMargin.toFixed(1),i.reasons.join("; "),i.groupSize);return row;});
-  const ws2=XLSX.utils.aoa_to_sheet([hR,...dR]);ws2["!cols"]=[{wch:12},{wch:34},{wch:16},{wch:46},{wch:10},{wch:16},{wch:26},{wch:20},{wch:7},{wch:5},{wch:11},{wch:8},{wch:12},{wch:11},{wch:7},{wch:12},{wch:8},{wch:8},{wch:8},{wch:8},{wch:8},{wch:30},{wch:6}];
+  const ws2=XLSX.utils.aoa_to_sheet([hR,...dR]);
+  // Column widths: Sev, Local, (Clasif?), SubCl, Item, Tam, Marca, Prov, Clase, Score, Mes, Vta/M, Uds/M, Rent/M, Vta$, Uds, Rent$, Mg%, %Vta, %Uds, %Rnt, %Mg, Razones, Grupo
+  var _rCols=[{wch:12},{wch:34}];if(_mc)_rCols.push({wch:16});_rCols.push({wch:16},{wch:46},{wch:10},{wch:16},{wch:26},{wch:20},{wch:7},{wch:5},{wch:12},{wch:8},{wch:12},{wch:12},{wch:8},{wch:12},{wch:9},{wch:7},{wch:7},{wch:7},{wch:7},{wch:30},{wch:6});
+  ws2["!cols"]=_rCols;
   ws2["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:dR.length,c:hR.length-1}})};
-  zCols(ws2,{8:ZS,9:ZI,10:ZD,11:ZI,12:ZD,13:ZD,14:ZI,15:ZD,16:ZP,17:ZS,18:ZS,19:ZS,20:ZS},1,dR.length);
+  // Format: offset by _mc. Base cols (without _mc): 8=Score,9=Mes,10=Vta/M,11=Uds/M,12=Rent/M,13=Vta$,14=Uds,15=Rent$,16=Mg%,17-20=%ils
+  var _o=_mc?1:0;
+  var _rFmt={};_rFmt[8+_o]=ZS;_rFmt[9+_o]=ZI;_rFmt[10+_o]=ZD;_rFmt[11+_o]=ZI;_rFmt[12+_o]=ZD;_rFmt[13+_o]=ZD;_rFmt[14+_o]=ZI;_rFmt[15+_o]=ZD;_rFmt[16+_o]=ZP;_rFmt[17+_o]=ZS;_rFmt[18+_o]=ZS;_rFmt[19+_o]=ZS;_rFmt[20+_o]=ZS;
+  zCols(ws2,_rFmt,1,dR.length);
   XLSX.utils.book_append_sheet(wb,ws2,"Items a Retirar");
 
   // ══ 3. Importados ══
@@ -524,28 +535,33 @@ function _buildExcel(a,fd){
 
   // ══ 5. Sim Retiro ══
   const sA=simulate(R,"all"),sC=simulate(R,"critico"),sM=simulate(R,"muy_bajo");
-  const srD=[["SIMULACIÓN DE RETIRO"+(CL?" — "+CL:"")+(hasF?" (CON FILTROS)":"")],[""],
+  const srD=[["SIMULACIÓN DE RETIRO (Mensual)"+(CL?" — "+CL:"")+(hasF?" (CON FILTROS)":"")],[""],
     ["","CRÍTICOS (<10)","CRÍT+M.BAJO (<20)","TODOS (<25)"],
     ["Items a retirar",sC.rN,sM.rN,sA.rN],
     ["% de items",sC.pN,sM.pN,sA.pN],
     ["SKUs únicos",sC.uI,sM.uI,sA.uI],
     ["Locales afectados",sC.uL,sM.uL,sA.uL],
     [""],
-    ["Venta perdida",sC.rV,sM.rV,sA.rV],
+    ["Vta bruta perdida/mes",sC.rVM,sM.rVM,sA.rVM],
+    ["Recuperación vta/mes",sC.recVtaM,sM.recVtaM,sA.recVtaM],
+    ["VTA NETA PERDIDA/MES",sC.netVM,sM.netVM,sA.netVM],
     ["% impacto venta",sC.pV,sM.pV,sA.pV],
-    ["Venta restante",sC.aV,sM.aV,sA.aV],
     [""],
-    ["Rent. perdida",sC.rR,sM.rR,sA.rR],
+    ["Rent bruta perdida/mes",sC.rRM,sM.rRM,sA.rRM],
+    ["Recuperación rent/mes",sC.recRentM,sM.recRentM,sA.recRentM],
+    ["RENT NETA PERDIDA/MES",sC.netRM,sM.netRM,sA.netRM],
     ["% impacto rent.",sC.pR,sM.pR,sA.pR],
-    ["Rent. restante",sC.aR,sM.aR,sA.aR],
-    [""],["POR SUB CLASIFICACIÓN (todos <25)"],["Sub Clasif.","Items","Venta Perdida","Rent. Perdida"]];
-  Object.entries(sA.bySC).sort((a,b)=>b[1].rent-a[1].rent).forEach(([k,d])=>srD.push([k,d.n,d.vta,d.rent]));
-  srD.push([""],["POR MARCA (todos <25)"],["Marca","Items","Venta Perdida","Rent. Perdida"]);
-  Object.entries(sA.byMarca).sort((a,b)=>b[1].rent-a[1].rent).slice(0,30).forEach(([k,d])=>srD.push([k,d.n,d.vta,d.rent]));
-  srD.push([""],["POR PROVEEDOR (todos <25)"],["Proveedor","Items","Venta Perdida","Rent. Perdida"]);
-  Object.entries(sA.byProv).sort((a,b)=>b[1].rent-a[1].rent).slice(0,30).forEach(([k,d])=>srD.push([k,d.n,d.vta,d.rent]));
-  const ws5=XLSX.utils.aoa_to_sheet(srD);ws5["!cols"]=[{wch:30},{wch:20},{wch:22},{wch:22}];
-  for(var _r5=0;_r5<srD.length;_r5++){[1,2,3].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r5,c:c});if(!ws5[ref]||ws5[ref].t!=='n')return;var v=ws5[ref].v;if(v===0)return;if(Math.abs(v)<1)ws5[ref].z=ZP;else if(Math.abs(v)>=100)ws5[ref].z=ZD;else ws5[ref].z=ZI;});}
+    ["Recuperación promedio",sC.avgRecRate,sM.avgRecRate,sA.avgRecRate],
+    [""],["POR SUB CLASIFICACIÓN (todos <25)"],["Sub Clasif.","Items","Vta Bruta/M","Vta Neta/M","Rent Bruta/M","Rent Neta/M"]];
+  Object.entries(sA.bySC).sort((a,b)=>b[1].rentN-a[1].rentN).forEach(([k,d])=>srD.push([k,d.n,d.vtaM,d.vtaN,d.rentM,d.rentN]));
+  srD.push([""],["POR MARCA (todos <25)"],["Marca","Items","Vta Bruta/M","Vta Neta/M","Rent Bruta/M","Rent Neta/M"]);
+  Object.entries(sA.byMarca).sort((a,b)=>b[1].rentN-a[1].rentN).slice(0,30).forEach(([k,d])=>srD.push([k,d.n,d.vtaM,d.vtaN,d.rentM,d.rentN]));
+  srD.push([""],["POR PROVEEDOR (todos <25)"],["Proveedor","Items","Vta Bruta/M","Vta Neta/M","Rent Bruta/M","Rent Neta/M"]);
+  Object.entries(sA.byProv).sort((a,b)=>b[1].rentN-a[1].rentN).slice(0,30).forEach(([k,d])=>srD.push([k,d.n,d.vtaM,d.vtaN,d.rentM,d.rentN]));
+  const ws5=XLSX.utils.aoa_to_sheet(srD);ws5["!cols"]=[{wch:30},{wch:18},{wch:16},{wch:16},{wch:16},{wch:16}];
+  // Format: explicit per row type
+  for(var _r5=0;_r5<srD.length;_r5++){var _lbl5=(srD[_r5][0]||"").toString().toLowerCase();var _isPct=_lbl5.includes("% imp")||_lbl5.includes("% de items")||_lbl5.includes("recuperación prom");var _isDol=_lbl5.includes("vta")||_lbl5.includes("rent")||_lbl5.includes("recuperación v")||_lbl5.includes("recuperación r");var _isInt=_lbl5.includes("items")||_lbl5.includes("skus")||_lbl5.includes("locales");
+    [1,2,3,4,5].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r5,c:c});if(!ws5[ref]||ws5[ref].t!=='n')return;if(_isPct)ws5[ref].z=ZP;else if(_isDol)ws5[ref].z=ZD;else if(_isInt)ws5[ref].z=ZI;else if(srD[_r5].length>=6&&c>=2)ws5[ref].z=ZD;else ws5[ref].z=ZI;});}
   XLSX.utils.book_append_sheet(wb,ws5,"Sim. Retiro");
 
   // ══ 6. Activar Productos ══
@@ -554,9 +570,11 @@ function _buildExcel(a,fd){
   const hA=_hABase.concat(_hasTramos?["Tramos","Items/Tramo","Ajuste Sat."]:[]);
   const dA=(AR||[]).map(r=>{const row=[r.targetLocal];if(_mc)row.push(r.clasificacion||"");row.push(r.item,r.subClasif,r.marca,r.tamano,r.proveedor,r.storesCarrying,+r.avgRent.toFixed(2),+r.avgVta.toFixed(2),(r.cannibRate||0),+(r.netRent||0).toFixed(2),+(r.netVta||0).toFixed(2),Math.round(r.netCant||0),r.avgMrg,+r.avgScore.toFixed(1),+r.strength.toFixed(1),r.reason,r.topStores.join(", "));if(_hasTramos){row.push(r.tramos||"",r.density!=null?+r.density.toFixed(1):"",r.tramosMod!=null?+r.tramosMod.toFixed(2):"");}return row;});
   const ws6=XLSX.utils.aoa_to_sheet([hA,...dA]);ws6["!autofilter"]={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:dA.length,c:hA.length-1}})};
-  var _aCols=[{wch:34},{wch:46},{wch:16},{wch:16},{wch:10},{wch:24},{wch:8},{wch:11},{wch:11},{wch:8},{wch:11},{wch:11},{wch:8},{wch:8},{wch:7},{wch:7},{wch:48},{wch:56}];
-  var _aFmt={6:ZI,7:ZD,8:ZD,9:ZP,10:ZD,11:ZD,12:ZI,13:ZP,14:ZS,15:ZS};
-  if(_hasTramos){_aCols.push({wch:8},{wch:10},{wch:10});_aFmt[18]=ZI;_aFmt[19]=ZS;_aFmt[20]=ZS;}
+  // Cols: Local, (Clasif?), Item, SubCl, Marca, Tam, Prov, LocSim, RentBr, VtaBr, Canib%, RentNt, VtaNt, UdsNt, Mg%, Score, Fuerza, Razón, LocRef, (Tramos, It/Tr, AjSat)
+  var _aCols=[{wch:34}];if(_mc)_aCols.push({wch:16});_aCols.push({wch:46},{wch:16},{wch:16},{wch:10},{wch:24},{wch:8},{wch:12},{wch:12},{wch:8},{wch:12},{wch:12},{wch:8},{wch:8},{wch:7},{wch:7},{wch:48},{wch:56});
+  var _aO=_mc?1:0;
+  var _aFmt={};_aFmt[6+_aO]=ZI;_aFmt[7+_aO]=ZD;_aFmt[8+_aO]=ZD;_aFmt[9+_aO]=ZP;_aFmt[10+_aO]=ZD;_aFmt[11+_aO]=ZD;_aFmt[12+_aO]=ZI;_aFmt[13+_aO]=ZP;_aFmt[14+_aO]=ZS;_aFmt[15+_aO]=ZS;
+  if(_hasTramos){_aCols.push({wch:8},{wch:10},{wch:10});_aFmt[18+_aO]=ZI;_aFmt[19+_aO]=ZS;_aFmt[20+_aO]=ZS;}
   ws6["!cols"]=_aCols;
   zCols(ws6,_aFmt,1,dA.length);
   XLSX.utils.book_append_sheet(wb,ws6,"Activar Productos");
@@ -581,7 +599,8 @@ function _buildExcel(a,fd){
   saD.push([""],["POR PROVEEDOR"],["Proveedor","Oport.","Vta Bruta","Vta Neta","Rent Bruta","Rent Neta"]);
   grpActXL("proveedor").slice(0,30).forEach(([k,d])=>saD.push([k,d.n,d.vB,d.vN,d.rB,d.rN]));
   const ws7=XLSX.utils.aoa_to_sheet(saD);ws7["!cols"]=[{wch:36},{wch:18},{wch:18},{wch:22},{wch:18},{wch:18}];
-  for(var _r7=0;_r7<saD.length;_r7++){[1,2,3,4,5].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r7,c:c});if(!ws7[ref]||ws7[ref].t!=='n')return;var v=ws7[ref].v;if(v===0)return;if(Math.abs(v)<1)ws7[ref].z=ZP;else if(Math.abs(v)>=100)ws7[ref].z=ZD;else ws7[ref].z=ZI;});}
+  for(var _r7=0;_r7<saD.length;_r7++){var _lbl7=(saD[_r7][0]||"").toString().toLowerCase();var _isPct7=_lbl7.includes("canib");var _isDol7=_lbl7.includes("venta")||_lbl7.includes("rent");var _isInt7=_lbl7.includes("oportunid")||_lbl7.includes("skus")||_lbl7.includes("locales");
+    [1,2,3,4,5].forEach(function(c){var ref=XLSX.utils.encode_cell({r:_r7,c:c});if(!ws7[ref]||ws7[ref].t!=='n')return;if(_isPct7)ws7[ref].z=ZP;else if(_isDol7)ws7[ref].z=ZD;else if(_isInt7)ws7[ref].z=ZI;else if(saD[_r7].length>=6&&c>=2)ws7[ref].z=ZD;else ws7[ref].z=ZI;});}
   XLSX.utils.book_append_sheet(wb,ws7,"Sim. Activación");
 
   // ══ 8. Resumen Locales ══
