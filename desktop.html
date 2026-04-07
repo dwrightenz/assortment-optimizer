@@ -197,6 +197,141 @@ function parseAlcances(wb){
   return{alcMap:m,alcDates};
 }
 
+// ═══ PARSE DATASET (UNIFIED 5-SHEET FORMAT) ═══
+// Sheets: VENTA USD, VENTAS UND, RENTABILIDAD NC, MARGEN NC, ALCANCE
+// Each sheet is long format: one row per (SKU × local)
+function isDatasetFormat(wb){
+  const sn=wb.SheetNames.map(s=>s.toUpperCase().trim());
+  return sn.includes("VENTA USD")&&sn.includes("ALCANCE")&&(sn.includes("VENTAS UND")||sn.includes("RENTABILIDAD NC"));
+}
+
+function parseDataset(wb,filename){
+  // Find sheets by name (case-insensitive)
+  const findSheet=name=>{const idx=wb.SheetNames.findIndex(s=>s.toUpperCase().trim()===name);return idx>=0?wb.Sheets[wb.SheetNames[idx]]:null;};
+  const wsV=findSheet("VENTA USD"),wsU=findSheet("VENTAS UND"),wsR=findSheet("RENTABILIDAD NC"),wsM=findSheet("MARGEN NC"),wsA=findSheet("ALCANCE");
+  if(!wsV||!wsU||!wsR||!wsM)throw new Error("Dataset debe tener hojas: VENTA USD, VENTAS UND, RENTABILIDAD NC, MARGEN NC");
+  if(!wsA)throw new Error("Dataset debe tener hoja: ALCANCE");
+
+  // Helper: read cell value
+  function cellVal(ws,r,col){const a=XLSX.utils.encode_cell({r,c:col});return ws[a]?ws[a].v:null;}
+  function cellObj(ws,r,col){const a=XLSX.utils.encode_cell({r,c:col});return ws[a]||null;}
+
+  // Detect columns from header row (row 0) of VENTA USD
+  const rng=XLSX.utils.decode_range(wsV["!ref"]);
+  const hdr=[];for(let i=0;i<=rng.e.c;i++)hdr.push((cellVal(wsV,0,i)||"").toString().trim());
+  const ci={};
+  hdr.forEach((h,i)=>{
+    const hl=h.toLowerCase();
+    if(hl.includes("subdivisión")||hl==="subdivisión"||hl==="subdivision")ci.sd=i;
+    else if(hl.includes("subclasificaci"))ci.sc=i;
+    else if((hl.includes("clasificaci")||hl.includes("clasificac"))&&!hl.includes("sub"))ci.cf=i;
+    else if(hl.includes("departamento"))ci.dp=i;
+    else if(hl.includes("división")||hl.includes("division"))ci.dv=i;
+    else if(hl.includes("origen"))ci.or=i;
+    else if(hl.includes("proveedor"))ci.pv=i;
+    else if(hl.includes("nom marca")||hl==="marca"||hl==="nom marca")ci.mk=i;
+    else if(hl.includes("código de barras")||hl.includes("codigo de barras"))ci.cb=i;
+    else if(hl==="item")ci.it=i;
+    else if(hl.includes("nombre item"))ci.nm=i;
+    else if(hl.includes("unidad operativa"))ci.uo=i;
+    else if(hl.includes("clase merc"))ci.cl=i;
+    else if(hl.includes("tamaño")||hl.includes("tamano"))ci.tm=i;
+  });
+  // Metric column is the last column in each sheet
+  const metricCol=rng.e.c;
+
+  // Build lookup maps for UND, RENT, MARGEN by key=(barcode+"|"+local)
+  function buildMetricMap(ws){
+    if(!ws)return{};
+    const r2=XLSX.utils.decode_range(ws["!ref"]);
+    // Find barcode & local columns (same structure as VENTA USD)
+    const h2=[];for(let i=0;i<=r2.e.c;i++)h2.push((cellVal(ws,0,i)||"").toString().trim().toLowerCase());
+    let cbCol=-1,uoCol=-1,mCol=r2.e.c;
+    h2.forEach((h,i)=>{if(h.includes("código de barras")||h.includes("codigo de barras"))cbCol=i;else if(h.includes("unidad operativa"))uoCol=i;});
+    if(cbCol<0||uoCol<0)return{};
+    const m={};
+    for(let r=1;r<=r2.e.r;r++){
+      const cb=(cellVal(ws,r,cbCol)||"").toString().trim();
+      const uo=(cellVal(ws,r,uoCol)||"").toString().trim();
+      if(!cb||!uo)continue;
+      const v=parseFloat(cellVal(ws,r,mCol))||0;
+      m[cb+"|"+uo]=v;
+    }
+    return m;
+  }
+  const undMap=buildMetricMap(wsU),rentMap=buildMetricMap(wsR),mrgMap=buildMetricMap(wsM);
+
+  // Parse VENTA USD rows + join with other metrics
+  const items=[],localSet=new Set(),subClasifSet=new Set(),clasificSet=new Set();
+  const validDivisions=new Set();// We'll filter out footer rows by checking Division
+  for(let r=1;r<=rng.e.r;r++){
+    const dv=ci.dv!=null?(cellVal(wsV,r,ci.dv)||"").toString().trim():"";
+    // Skip footer/total rows
+    if(!dv||dv.toLowerCase()==="total"||dv.toLowerCase().includes("filtro"))continue;
+    const cb=ci.cb!=null?(cellVal(wsV,r,ci.cb)||"").toString().trim():"";
+    const uo=ci.uo!=null?(cellVal(wsV,r,ci.uo)||"").toString().trim():"";
+    if(!cb||!uo)continue;
+    const key=cb+"|"+uo;
+    const sc=ci.sc!=null?(cellVal(wsV,r,ci.sc)||"").toString().trim():"SIN SC";
+    const cf=ci.cf!=null?(cellVal(wsV,r,ci.cf)||"").toString().trim():"";
+    const it=ci.it!=null?(cellVal(wsV,r,ci.it)||"").toString().trim():cb;
+    const nm=ci.nm!=null?(cellVal(wsV,r,ci.nm)||"").toString().trim():"";
+    const or=ci.or!=null?(cellVal(wsV,r,ci.or)||"").toString().trim():"";
+    const pv=ci.pv!=null?(cellVal(wsV,r,ci.pv)||"").toString().trim():"";
+    const mk=ci.mk!=null?(cellVal(wsV,r,ci.mk)||"").toString().trim():"";
+    const tm=ci.tm!=null?(cellVal(wsV,r,ci.tm)||"").toString().trim():"";
+    const cl=ci.cl!=null?(cellVal(wsV,r,ci.cl)||"").toString().trim():"";
+    const ventaUSD=parseFloat(cellVal(wsV,r,metricCol))||0;
+    const cantidad=undMap[key]||0;
+    const rentabilidad=rentMap[key]||0;
+    const margen=mrgMap[key]||0;
+    subClasifSet.add(sc);if(cf)clasificSet.add(cf);
+    localSet.add(uo);
+    items.push({local:uo,clasificacion:cf,subClasif:sc,item:it,tamano:tm,marca:mk,proveedor:pv,origen:or,claseMerc:cl,esImportado:/import/i.test(or),ventaUSD,cantidad,rentabilidad,margen});
+  }
+  const clasificaciones=[...clasificSet].sort();
+  const isMultiClasif=clasificaciones.length>1;
+  const clasificacion=extractClasifName(filename)||(clasificaciones.length?clasificaciones[0]:"");
+  const vd={items,locals:[...localSet].sort(),subClasifs:[...subClasifSet].sort(),clasificacion,clasificaciones,isMultiClasif};
+
+  // Parse ALCANCE sheet
+  const rngA=XLSX.utils.decode_range(wsA["!ref"]);
+  const hdrA=[];for(let i=0;i<=rngA.e.c;i++)hdrA.push((cellVal(wsA,0,i)||"").toString().trim().toLowerCase());
+  let acbCol=-1,auoCol=-1,adtCol=-1;
+  hdrA.forEach((h,i)=>{
+    if(h.includes("código de barras")||h.includes("codigo de barras"))acbCol=i;
+    else if(h.includes("unidad operativa"))auoCol=i;
+    else if(h.includes("fec_inicio")||h.includes("fecha"))adtCol=i;
+  });
+  const alcMap={},alcDates={};
+  const aitCol=hdrA.findIndex(h=>h==="item");
+  if(acbCol>=0&&auoCol>=0){
+    for(let r=1;r<=rngA.e.r;r++){
+      const cb=(cellVal(wsA,r,acbCol)||"").toString().trim();
+      const uo=(cellVal(wsA,r,auoCol)||"").toString().trim();
+      if(!cb||!uo)continue;
+      // Use Item format (barcode-name) if available, else just barcode
+      const it=aitCol>=0?(cellVal(wsA,r,aitCol)||"").toString().trim():cb;
+      const itemKey=it||cb;
+      if(!alcMap[itemKey])alcMap[itemKey]=new Set();
+      alcMap[itemKey].add(uo);
+      // Parse date
+      if(adtCol>=0){
+        let dt=null;
+        const dc=cellObj(wsA,r,adtCol);
+        if(dc){
+          if(dc.t==='d')dt=new Date(dc.v);
+          else if(dc.t==='n'&&dc.v)dt=new Date((dc.v-25569)*86400000);
+          else if(dc.t==='s'&&dc.v){const p=Date.parse(dc.v);if(!isNaN(p))dt=new Date(p);}
+        }
+        if(dt){if(!alcDates[itemKey])alcDates[itemKey]={};if(!alcDates[itemKey][uo]||dt<alcDates[itemKey][uo])alcDates[itemKey][uo]=dt;}
+      }
+    }
+  }
+  const ad={alcMap,alcDates};
+  return{vd,ad};
+}
+
 // ═══ ANALYSIS ═══
 function runAnalysis(vd,ad){
   const ak=new Set(Object.keys(ad.alcMap));
@@ -1001,7 +1136,7 @@ function _buildPPTXNative(a,fd){
 })();
 
 // ═══ STATE ═══
-const S={step:"upload",ventasFiles:[],alcancesFiles:[],analysis:null,loading:false,error:"",
+const S={step:"upload",ventasFiles:[],alcancesFiles:[],datasetFiles:[],analysis:null,loading:false,error:"",
   tab:"exec",selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),
   txtItem:"",onlyFlagged:true,
   nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,
@@ -1015,37 +1150,63 @@ function ss(p){Object.assign(S,p);const ae=document.activeElement;const fi=ae&&a
 function readF(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>{try{res(XLSX.read(new Uint8Array(e.target.result),{type:"array"}))}catch(e2){rej(e2)}};r.onerror=()=>rej(new Error("Error leyendo archivo"));r.readAsArrayBuffer(file);});}
 
 async function analyze(){
-  if(!S.ventasFiles.length||!S.alcancesFiles.length){ss({error:"Sube ambos archivos"});return;}
+  const hasDataset=S.datasetFiles.length>0;
+  const hasTraditional=S.ventasFiles.length>0&&S.alcancesFiles.length>0;
+  if(!hasDataset&&!hasTraditional){ss({error:"Sube un dataset unificado O ambos archivos (Ventas + Alcances)"});return;}
   ss({loading:true,error:""});
   try{
-    const vWbs=await Promise.all(S.ventasFiles.map(f=>readF(f)));
-    const aWbs=await Promise.all(S.alcancesFiles.map(f=>readF(f)));
-    // Combine ventas
-    let combItems=[],combLocs=new Set(),combSCs=new Set(),combClasifs=new Set(),fileLabels=[];
-    vWbs.forEach((wb,i)=>{
-      const vd=parseVentas(wb,S.ventasFiles[i].name);
-      fileLabels.push(vd.clasificacion);
-      // If file has no clasificación column, stamp items with filename-derived clasif
-      if(vd.clasificaciones.length===0&&vd.clasificacion){
-        const cl=vd.clasificacion.toUpperCase();
-        vd.items.forEach(it=>{it.clasificacion=cl;});
-        combClasifs.add(cl);
-      } else {
-        vd.clasificaciones.forEach(c=>combClasifs.add(c));
-      }
-      combItems=combItems.concat(vd.items);
-      vd.locals.forEach(l=>combLocs.add(l));
-      vd.subClasifs.forEach(s=>combSCs.add(s));
-    });
-    const clasificaciones=[...combClasifs].sort();
-    const isMultiClasif=clasificaciones.length>1;
-    const cLabel=S.ventasFiles.length>1&&S.analysisName.trim()?S.analysisName.trim():(fileLabels[0]||"");
-    const vd={items:combItems,locals:[...combLocs].sort(),subClasifs:[...combSCs].sort(),clasificacion:cLabel,clasificaciones,isMultiClasif};
-    // Combine alcances
-    const mergedAlc={},mergedDates={};
-    aWbs.forEach(wb=>{const ad=parseAlcances(wb);for(const[it,s]of Object.entries(ad.alcMap)){if(!mergedAlc[it])mergedAlc[it]=new Set();s.forEach(l=>mergedAlc[it].add(l));}
-      for(const[it,locals]of Object.entries(ad.alcDates||{})){if(!mergedDates[it])mergedDates[it]={};for(const[loc,dt]of Object.entries(locals)){if(!mergedDates[it][loc]||dt<mergedDates[it][loc])mergedDates[it][loc]=dt;}}});
-    const ad={alcMap:mergedAlc,alcDates:mergedDates};
+    let vd,ad;
+    if(hasDataset){
+      // Unified dataset path
+      const dsWbs=await Promise.all(S.datasetFiles.map(f=>readF(f)));
+      let combItems=[],combLocs=new Set(),combSCs=new Set(),combClasifs=new Set(),fileLabels=[];
+      const mergedAlc={},mergedDates={};
+      dsWbs.forEach((wb,i)=>{
+        if(!isDatasetFormat(wb))throw new Error(S.datasetFiles[i].name+" no tiene el formato de dataset (necesita hojas: VENTA USD, VENTAS UND, RENTABILIDAD NC, MARGEN NC, ALCANCE)");
+        const ds=parseDataset(wb,S.datasetFiles[i].name);
+        fileLabels.push(ds.vd.clasificacion);
+        if(ds.vd.clasificaciones.length===0&&ds.vd.clasificacion){
+          const cl=ds.vd.clasificacion.toUpperCase();
+          ds.vd.items.forEach(it=>{it.clasificacion=cl;});
+          combClasifs.add(cl);
+        }else{ds.vd.clasificaciones.forEach(c=>combClasifs.add(c));}
+        combItems=combItems.concat(ds.vd.items);
+        ds.vd.locals.forEach(l=>combLocs.add(l));
+        ds.vd.subClasifs.forEach(s=>combSCs.add(s));
+        for(const[it,s]of Object.entries(ds.ad.alcMap)){if(!mergedAlc[it])mergedAlc[it]=new Set();s.forEach(l=>mergedAlc[it].add(l));}
+        for(const[it,locals]of Object.entries(ds.ad.alcDates||{})){if(!mergedDates[it])mergedDates[it]={};for(const[loc,dt]of Object.entries(locals)){if(!mergedDates[it][loc]||dt<mergedDates[it][loc])mergedDates[it][loc]=dt;}}
+      });
+      const clasificaciones=[...combClasifs].sort();
+      const isMultiClasif=clasificaciones.length>1;
+      const cLabel=S.datasetFiles.length>1&&S.analysisName.trim()?S.analysisName.trim():(fileLabels[0]||"");
+      vd={items:combItems,locals:[...combLocs].sort(),subClasifs:[...combSCs].sort(),clasificacion:cLabel,clasificaciones,isMultiClasif};
+      ad={alcMap:mergedAlc,alcDates:mergedDates};
+    }else{
+      // Traditional 2-file path
+      const vWbs=await Promise.all(S.ventasFiles.map(f=>readF(f)));
+      const aWbs=await Promise.all(S.alcancesFiles.map(f=>readF(f)));
+      let combItems=[],combLocs=new Set(),combSCs=new Set(),combClasifs=new Set(),fileLabels=[];
+      vWbs.forEach((wb,i)=>{
+        const v=parseVentas(wb,S.ventasFiles[i].name);
+        fileLabels.push(v.clasificacion);
+        if(v.clasificaciones.length===0&&v.clasificacion){
+          const cl=v.clasificacion.toUpperCase();
+          v.items.forEach(it=>{it.clasificacion=cl;});
+          combClasifs.add(cl);
+        }else{v.clasificaciones.forEach(c=>combClasifs.add(c));}
+        combItems=combItems.concat(v.items);
+        v.locals.forEach(l=>combLocs.add(l));
+        v.subClasifs.forEach(s=>combSCs.add(s));
+      });
+      const clasificaciones=[...combClasifs].sort();
+      const isMultiClasif=clasificaciones.length>1;
+      const cLabel=S.ventasFiles.length>1&&S.analysisName.trim()?S.analysisName.trim():(fileLabels[0]||"");
+      vd={items:combItems,locals:[...combLocs].sort(),subClasifs:[...combSCs].sort(),clasificacion:cLabel,clasificaciones,isMultiClasif};
+      const mergedAlc={},mergedDates={};
+      aWbs.forEach(wb=>{const a2=parseAlcances(wb);for(const[it,s]of Object.entries(a2.alcMap)){if(!mergedAlc[it])mergedAlc[it]=new Set();s.forEach(l=>mergedAlc[it].add(l));}
+        for(const[it,locals]of Object.entries(a2.alcDates||{})){if(!mergedDates[it])mergedDates[it]={};for(const[loc,dt]of Object.entries(locals)){if(!mergedDates[it][loc]||dt<mergedDates[it][loc])mergedDates[it][loc]=dt;}}});
+      ad={alcMap:mergedAlc,alcDates:mergedDates};
+    }
     const r=runAnalysis(vd,ad);
     r._alcMap=ad.alcMap;
     // Tramos: only for single-classification (multi-clasif tramos TBD)
@@ -1153,7 +1314,7 @@ window.doExportExcel=function(){
   if(typeof XLSX==="undefined"){alert("Error: La librería XLSX no se cargó. Recarga la página.");return;}
   try{_buildExcel(S.analysis,getFiltered());}catch(e){alert("Error: "+e.message);console.error(e);}
 };
-window.resetApp=function(){ss({step:"upload",analysis:null,ventasFiles:[],alcancesFiles:[],analysisName:"",selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,satLevel:"no_saturada",tramosFile:null,tramosPreview:null});};
+window.resetApp=function(){ss({step:"upload",analysis:null,ventasFiles:[],alcancesFiles:[],datasetFiles:[],analysisName:"",selLocals:new Set(),selClasifs:new Set(),selSCs:new Set(),selMarcas:new Set(),selProvs:new Set(),txtItem:"",page:0,resDim:"subClasif",nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null,satLevel:"no_saturada",tramosFile:null,tramosPreview:null});};
 window.changeSat=function(level){S.satLevel=level;if(S.analysis){S.analysis._satLevel=level;S.analysis.activationRecos=buildActivationRecos(S.analysis,S.analysis._tramosData||null,level);}render();};
 window.setNF=function(f,v){const x=v===""?null:parseFloat(v);ss({[f]:isNaN(x)?null:x,page:0});};
 window.applyPreset=function(p){const pr={"conVenta":{nfVentaMin:0.01,nfVentaMax:null},"sinVenta":{nfVentaMin:null,nfVentaMax:0},"rentPos":{nfRentMin:0.01,nfRentMax:null},"rentNeg":{nfRentMin:null,nfRentMax:0},"sCrit":{nfScoreMin:null,nfScoreMax:10},"sMB":{nfScoreMin:null,nfScoreMax:20},"clear":{nfVentaMin:null,nfVentaMax:null,nfCantMin:null,nfCantMax:null,nfRentMin:null,nfRentMax:null,nfMargenMin:null,nfMargenMax:null,nfScoreMin:null,nfScoreMax:null}};if(pr[p])ss({...pr[p],page:0});};
@@ -1192,31 +1353,39 @@ function render(){const app=document.getElementById("app");if(S.step==="upload")
 function renderUpload(app){
   app.innerHTML=`<div class="hdr"><div><span style="font-size:16px;font-weight:800;letter-spacing:-.5px">ASSORTMENT OPTIMIZER</span></div><div><button class="btn btn-s btn-sm" onclick="goTramos()">⚙ Tramos</button></div></div>
   <div class="cnt fade" style="max-width:740px;padding-top:36px">
-    <div style="text-align:center;margin-bottom:28px"><div style="font-size:26px;font-weight:800;letter-spacing:-.8px;margin-bottom:5px">Sube tus archivos</div><div style="font-size:12px;color:var(--tx3)">Ventas (tabla cruzada) + Alcances (Clase R). La clasificación se lee del nombre del archivo de ventas.</div></div>
-    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px">
-      <div class="upload-zone ${S.ventasFiles.length?"ok":""}" id="dV" onclick="document.getElementById('fV').click()"><input type="file" id="fV" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📊</div><div style="font-size:12px;font-weight:700;color:${S.ventasFiles.length?"var(--green)":"var(--tx2)"}">Ventas ${S.ventasFiles.length>1?"("+S.ventasFiles.length+")":""}</div><div style="font-size:10px;color:${S.ventasFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.ventasFiles.length?S.ventasFiles.map(f=>esc(f.name)).join("<br>"):"4 métricas por local"}</div>${S.ventasFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({ventasFiles:[],analysisName:''})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
-      <div class="upload-zone ${S.alcancesFiles.length?"ok":""}" id="dA" onclick="document.getElementById('fA').click()"><input type="file" id="fA" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📋</div><div style="font-size:12px;font-weight:700;color:${S.alcancesFiles.length?"var(--green)":"var(--tx2)"}">Alcances ${S.alcancesFiles.length>1?"("+S.alcancesFiles.length+")":""}</div><div style="font-size:10px;color:${S.alcancesFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.alcancesFiles.length?S.alcancesFiles.map(f=>esc(f.name)).join("<br>"):"1 = activo"}</div>${S.alcancesFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({alcancesFiles:[]})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
+    <div style="text-align:center;margin-bottom:28px"><div style="font-size:26px;font-weight:800;letter-spacing:-.8px;margin-bottom:5px">Sube tus archivos</div><div style="font-size:12px;color:var(--tx3)">Dataset unificado (5 hojas) o Ventas + Alcances por separado.</div></div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px;align-items:stretch">
+      <div class="upload-zone ${S.datasetFiles.length?"ok":""}" id="dD" onclick="document.getElementById('fD').click()" style="${S.ventasFiles.length||S.alcancesFiles.length?"opacity:.4;pointer-events:none":""}"><input type="file" id="fD" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📦</div><div style="font-size:12px;font-weight:700;color:${S.datasetFiles.length?"var(--green)":"var(--tx2)"}">Dataset Unificado ${S.datasetFiles.length>1?"("+S.datasetFiles.length+")":""}</div><div style="font-size:10px;color:${S.datasetFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.datasetFiles.length?S.datasetFiles.map(f=>esc(f.name)).join("<br>"):"5 hojas: Vta, Uds, Rent, Mrg, Alcance"}</div>${S.datasetFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({datasetFiles:[],analysisName:''})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
+      <div style="display:flex;align-items:center;padding:0 4px;color:var(--tx4);font-size:11px;font-weight:700">O</div>
+      <div class="upload-zone ${S.ventasFiles.length?"ok":""}" id="dV" onclick="document.getElementById('fV').click()" style="${S.datasetFiles.length?"opacity:.4;pointer-events:none":""}"><input type="file" id="fV" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📊</div><div style="font-size:12px;font-weight:700;color:${S.ventasFiles.length?"var(--green)":"var(--tx2)"}">Ventas ${S.ventasFiles.length>1?"("+S.ventasFiles.length+")":""}</div><div style="font-size:10px;color:${S.ventasFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.ventasFiles.length?S.ventasFiles.map(f=>esc(f.name)).join("<br>"):"4 métricas por local"}</div>${S.ventasFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({ventasFiles:[],analysisName:''})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
+      <div class="upload-zone ${S.alcancesFiles.length?"ok":""}" id="dA" onclick="document.getElementById('fA').click()" style="${S.datasetFiles.length?"opacity:.4;pointer-events:none":""}"><input type="file" id="fA" accept=".xlsx,.xls" multiple style="display:none"><div style="font-size:28px">📋</div><div style="font-size:12px;font-weight:700;color:${S.alcancesFiles.length?"var(--green)":"var(--tx2)"}">Alcances ${S.alcancesFiles.length>1?"("+S.alcancesFiles.length+")":""}</div><div style="font-size:10px;color:${S.alcancesFiles.length?"var(--green)":"var(--tx3)"};margin-top:3px">${S.alcancesFiles.length?S.alcancesFiles.map(f=>esc(f.name)).join("<br>"):"1 = activo"}</div>${S.alcancesFiles.length?`<div style="margin-top:4px"><button class="btn btn-s btn-sm" onclick="event.stopPropagation();ss({alcancesFiles:[]})" style="font-size:9px;color:var(--red);border-color:var(--red)">✕ Limpiar</button></div>`:""}</div>
     </div>
-    ${S.ventasFiles.length>1?`<div class="crd" style="margin-top:4px;padding:12px 14px">
+    ${(S.ventasFiles.length>1||S.datasetFiles.length>1)?`<div class="crd" style="margin-top:4px;padding:12px 14px">
       <div style="font-size:9px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">NOMBRE DEL ANÁLISIS</div>
       <input type="text" id="anlName" value="${esc(S.analysisName)}" placeholder="Ej: Abarrotes, Lácteos + Bebidas..." style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--bg4);background:var(--bg2);color:var(--tx);font-family:var(--font);font-size:12px;outline:none" onchange="ss({analysisName:this.value})">
-      <div style="font-size:9px;color:var(--tx4);margin-top:3px">${S.ventasFiles.length} archivos seleccionados</div>
+      <div style="font-size:9px;color:var(--tx4);margin-top:3px">${(S.ventasFiles.length||S.datasetFiles.length)} archivos seleccionados</div>
     </div>`:""}
     <div class="crd" style="margin-top:4px;padding:12px 14px">
-      ${(()=>{const cl=S.ventasFiles.length?extractClasifName(S.ventasFiles[0].name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
+      ${(()=>{const sf=S.datasetFiles.length?S.datasetFiles[0]:S.ventasFiles.length?S.ventasFiles[0]:null;const cl=sf?extractClasifName(sf.name):"";const tr=cl?getTramosForClasif(cl):null;const n=tr?Object.keys(tr).length:0;return`<div style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${tr?"var(--green)":"var(--tx4)"}"></span><span style="font-size:10px;color:${tr?"var(--green)":"var(--tx4)"}">${tr?n+" tramos para "+(cl||"?"):"Sin tramos"+(cl?" para "+cl:"")}</span><button class="btn btn-s btn-sm" onclick="goTramos()" style="font-size:9px">⚙ Tramos</button></div>`;})()}
     </div>
     ${S.error?`<div style="color:var(--red);margin-bottom:10px;font-size:12px;text-align:center">${esc(S.error)}</div>`:""}
-    <div style="text-align:center"><button class="btn ${S.ventasFiles.length&&S.alcancesFiles.length?"btn-p":"btn-s"}" onclick="analyze()" ${S.loading||!S.ventasFiles.length||!S.alcancesFiles.length?"disabled":""}>${S.loading?'<span class="spin"></span> Procesando...':"Analizar Surtido"}</button></div>
+    <div style="text-align:center"><button class="btn ${S.datasetFiles.length||(S.ventasFiles.length&&S.alcancesFiles.length)?"btn-p":"btn-s"}" onclick="analyze()" ${S.loading||(!S.datasetFiles.length&&(!S.ventasFiles.length||!S.alcancesFiles.length))?"disabled":""}>${S.loading?'<span class="spin"></span> Procesando...':"Analizar Surtido"}</button></div>
     <div class="crd" style="margin-top:24px"><div style="font-size:11px;font-weight:700;color:var(--green);margin-bottom:6px">METODOLOGÍA</div><div style="font-size:11px;color:var(--tx3);line-height:1.7">
       Cada item se compara <strong style="color:var(--yellow)">SOLO vs pares del mismo LOCAL + CLASIFICACIÓN + SUB CLASIFICACIÓN</strong>. Clasificaciones y sub clasificaciones se leen del archivo.<br>
       <strong style="color:var(--tx2)">Score</strong> = <span class="mono">0.40×%Rent + 0.25×%Vta + 0.20×%Uds + 0.15×%Mrg</span>. Corte: &lt;25.<br>
       <strong style="color:var(--tx2)">Promedios mensuales:</strong> Si el archivo de alcances incluye columna FEC_INICIO, se calculan meses activos y promedios mensuales. Items con &lt;4 meses se excluyen.<br>
-      <strong style="color:var(--tx2)">Multi-clasificación:</strong> Se puede subir un archivo con varias clasificaciones. La similitud entre locales y activaciones se calculan con todo el archivo junto.
+      <strong style="color:var(--tx2)">Multi-clasificación:</strong> Se puede subir un archivo con varias clasificaciones. La similitud entre locales y activaciones se calculan con todo el archivo junto.<br>
+      <strong style="color:var(--tx2)">Dataset Unificado:</strong> Acepta archivos con 5 hojas (VENTA USD, VENTAS UND, RENTABILIDAD NC, MARGEN NC, ALCANCE) en formato long (una fila por SKU × local).
     </div></div>
   </div>`;
-  document.getElementById("fV").addEventListener("change",e=>{if(e.target.files.length)ss({ventasFiles:[...S.ventasFiles,...e.target.files],error:""});});
-  document.getElementById("fA").addEventListener("change",e=>{if(e.target.files.length)ss({alcancesFiles:[...S.alcancesFiles,...e.target.files],error:""});});
-  ["dV","dA"].forEach((id,i)=>{const el=document.getElementById(id);el.addEventListener("dragover",e=>{e.preventDefault();el.style.borderColor="var(--blue)";});el.addEventListener("dragleave",()=>el.style.borderColor="");el.addEventListener("drop",e=>{e.preventDefault();el.style.borderColor="";const fs=[...e.dataTransfer.files].filter(f=>/\.xlsx?$/i.test(f.name));if(fs.length)ss(i===0?{ventasFiles:[...S.ventasFiles,...fs],error:""}:{alcancesFiles:[...S.alcancesFiles,...fs],error:""});});});
+  document.getElementById("fD").addEventListener("change",e=>{if(e.target.files.length)ss({datasetFiles:[...S.datasetFiles,...e.target.files],ventasFiles:[],alcancesFiles:[],error:""});});
+  document.getElementById("fV").addEventListener("change",e=>{if(e.target.files.length)ss({ventasFiles:[...S.ventasFiles,...e.target.files],datasetFiles:[],error:""});});
+  document.getElementById("fA").addEventListener("change",e=>{if(e.target.files.length)ss({alcancesFiles:[...S.alcancesFiles,...e.target.files],datasetFiles:[],error:""});});
+  const dD=document.getElementById("dD");
+  dD.addEventListener("dragover",e=>{e.preventDefault();dD.style.borderColor="var(--blue)";});
+  dD.addEventListener("dragleave",()=>dD.style.borderColor="");
+  dD.addEventListener("drop",e=>{e.preventDefault();dD.style.borderColor="";const fs=[...e.dataTransfer.files].filter(f=>/\.xlsx?$/i.test(f.name));if(fs.length)ss({datasetFiles:[...S.datasetFiles,...fs],ventasFiles:[],alcancesFiles:[],error:""});});
+  ["dV","dA"].forEach((id,i)=>{const el=document.getElementById(id);el.addEventListener("dragover",e=>{e.preventDefault();el.style.borderColor="var(--blue)";});el.addEventListener("dragleave",()=>el.style.borderColor="");el.addEventListener("drop",e=>{e.preventDefault();el.style.borderColor="";const fs=[...e.dataTransfer.files].filter(f=>/\.xlsx?$/i.test(f.name));if(fs.length)ss(i===0?{ventasFiles:[...S.ventasFiles,...fs],datasetFiles:[],error:""}:{alcancesFiles:[...S.alcancesFiles,...fs],datasetFiles:[],error:""});});});
 }
 
 // ═══ TRAMOS CONFIG SCREEN ═══
