@@ -1150,11 +1150,12 @@ async function analyze(){
     let vd,ad;
     if(hasDataset){
       const dsWbs=await Promise.all(S.datasetFiles.map(f=>readF(f)));
-      let combItems=[],combLocs=new Set(),combSCs=new Set(),combClasifs=new Set(),fileLabels=[];
+      let combItems=[],combLocs=new Set(),combSCs=new Set(),combClasifs=new Set(),fileLabels=[],combPeriod=null;
       const mergedAlc={},mergedDates={};
       dsWbs.forEach((wb,i)=>{
         if(!isDatasetFormat(wb))throw new Error(S.datasetFiles[i].name+" no tiene el formato de dataset (necesita hojas: VENTA USD, VENTAS UND, RENTABILIDAD NC, MARGEN NC, ALCANCE)");
         const ds=parseDataset(wb,S.datasetFiles[i].name);
+        if(ds.vd.dataPeriodMonths)combPeriod=ds.vd.dataPeriodMonths;
         fileLabels.push(ds.vd.clasificacion);
         if(ds.vd.clasificaciones.length===0&&ds.vd.clasificacion){
           const cl=ds.vd.clasificacion.toUpperCase();
@@ -1170,7 +1171,7 @@ async function analyze(){
       const clasificaciones=[...combClasifs].sort();
       const isMultiClasif=clasificaciones.length>1;
       const cLabel=S.datasetFiles.length>1&&S.analysisName.trim()?S.analysisName.trim():(fileLabels[0]||"");
-      vd={items:combItems,locals:[...combLocs].sort(),subClasifs:[...combSCs].sort(),clasificacion:cLabel,clasificaciones,isMultiClasif};
+      vd={items:combItems,locals:[...combLocs].sort(),subClasifs:[...combSCs].sort(),clasificacion:cLabel,clasificaciones,isMultiClasif,dataPeriodMonths:combPeriod};
       ad={alcMap:mergedAlc,alcDates:mergedDates};
     }else{
       const vWbs=await Promise.all(S.ventasFiles.map(f=>readF(f)));
