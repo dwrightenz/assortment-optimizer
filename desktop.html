@@ -292,7 +292,11 @@ function parseDataset(wb,filename){
   const clasificaciones=[...clasificSet].sort();
   const isMultiClasif=clasificaciones.length>1;
   const clasificacion=extractClasifName(filename)||(clasificaciones.length?clasificaciones[0]:"");
-  const vd={items,locals:[...localSet].sort(),subClasifs:[...subClasifSet].sort(),clasificacion,clasificaciones,isMultiClasif};
+  // Estimate data period from filename (e.g. "1ENE-18MAR" = ~2.5 months)
+  let dataPeriodMonths=null;
+  const pm=filename.match(/(\d{1,2})\s*(ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)[A-Z]*[\s\-_]+(\d{1,2})\s*(ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)/i);
+  if(pm){const mi={ENE:0,FEB:1,MAR:2,ABR:3,MAY:4,JUN:5,JUL:6,AGO:7,SEP:8,OCT:9,NOV:10,DIC:11};const d1=parseInt(pm[1]),m1=mi[pm[2].toUpperCase()]||0,d2=parseInt(pm[3]),m2=mi[pm[4].toUpperCase()]||0;dataPeriodMonths=Math.max(1,Math.round(((m2-m1)*30+(d2-d1))/30*10)/10);}
+  const vd={items,locals:[...localSet].sort(),subClasifs:[...subClasifSet].sort(),clasificacion,clasificaciones,isMultiClasif,dataPeriodMonths};
 
   // Parse ALCANCE sheet
   const rngA=XLSX.utils.decode_range(wsA["!ref"]);
@@ -336,15 +340,18 @@ function parseDataset(wb,filename){
 function runAnalysis(vd,ad){
   const ak=new Set(Object.keys(ad.alcMap));
   const fil=vd.items.filter(r=>ak.has(r.item)&&ad.alcMap[r.item].has(r.local));
+  // Data period cap: if dataset specifies a period (e.g. 2.5 months), cap mesesActivos
+  const periodCap=vd.dataPeriodMonths||null;
   // Group key includes clasificacion for multi-clasif support
   const grp={};fil.forEach(r=>{const k=r.local+"|||"+(r.clasificacion||"")+"|||"+r.subClasif+"|||"+r.item;if(!grp[k])grp[k]=[];grp[k].push(r);});
   const sums0=Object.values(grp).map(recs=>{const f=recs[0];let vS=0,cS=0,rS=0,mS=0;recs.forEach(r=>{vS+=r.ventaUSD;cS+=r.cantidad;rS+=r.rentabilidad;mS+=r.margen;});
     // Calculate mesesActivos from alcDates
-    let mesesActivos=12;
-    if(ad.alcDates&&ad.alcDates[f.item]&&ad.alcDates[f.item][f.local]){const dt=ad.alcDates[f.item][f.local];const yr=dt.getFullYear();if(yr<2025)mesesActivos=12;else if(yr===2025)mesesActivos=Math.max(1,12-dt.getMonth());else mesesActivos=1;}
+    let mesesActivos=periodCap||12;
+    if(ad.alcDates&&ad.alcDates[f.item]&&ad.alcDates[f.item][f.local]){const dt=ad.alcDates[f.item][f.local];const yr=dt.getFullYear();if(yr<2025)mesesActivos=periodCap||12;else if(yr===2025){mesesActivos=Math.max(1,12-dt.getMonth());if(periodCap)mesesActivos=Math.min(mesesActivos,periodCap);}else mesesActivos=1;}
     return{...f,totalVenta:vS,totalCant:cS,totalRent:rS,avgMargen:mS/recs.length,mesesActivos};});
-  // Filter out items with < 4 meses activos
-  const sums=sums0.filter(s=>s.mesesActivos>=4);
+  // Filter out items with < 4 meses activos (skip filter if period is short)
+  const minMeses=periodCap&&periodCap<4?1:4;
+  const sums=sums0.filter(s=>s.mesesActivos>=minMeses);
   // Monthly averages
   sums.forEach(s=>{s.vtaPromMes=s.totalVenta/s.mesesActivos;s.cantPromMes=s.totalCant/s.mesesActivos;s.rentPromMes=s.totalRent/s.mesesActivos;});
   // Percentile groups: local + clasificacion + subClasif (items compared within their classification)
